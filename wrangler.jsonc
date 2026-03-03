@@ -1,0 +1,19 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "r2-media-worker",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-03-03",
+  "observability": {
+    "enabled": true
+  },
+  "compatibility_flags": ["nodejs_compat"],
+  "r2_buckets": [
+    {
+      "binding": "BUCKET",
+      "bucket_name": "paezandmore"
+    }
+  ],
+  "vars": {
+    "ALLOWED_ORIGIN": "http://localhost:4321"
+  }
+}
