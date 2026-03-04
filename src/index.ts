@@ -40,7 +40,22 @@ export default {
       return new Response(null, { status: 204, headers: corsHeaders(origin) });
     }
 
-    // Auth — bloquea todo sin el secret
+    // ── GET /file/:key — público, sin auth (imágenes para la landing) ────────
+    if (method === "GET" && url.pathname.startsWith("/file/")) {
+      const key = decodeURIComponent(url.pathname.slice("/file/".length));
+      const object = await env.BUCKET.get(key);
+
+      if (!object) return json({ error: "Not found" }, 404, origin);
+
+      const headers = new Headers(corsHeaders(origin));
+      object.writeHttpMetadata(headers);
+      headers.set("etag", object.httpEtag);
+      headers.set("cache-control", "public, max-age=31536000");
+
+      return new Response(object.body, { headers });
+    }
+
+    // Auth — bloquea el resto de endpoints sin el secret
     if (!isAuthorized(request, env)) {
       return json({ error: "Unauthorized" }, 401, origin);
     }
@@ -80,21 +95,6 @@ export default {
         200,
         origin
       );
-    }
-
-    // ── GET /file/:key ───────────────────────────────────────────────────────
-    if (method === "GET" && url.pathname.startsWith("/file/")) {
-      const key = decodeURIComponent(url.pathname.slice("/file/".length));
-      const object = await env.BUCKET.get(key);
-
-      if (!object) return json({ error: "Not found" }, 404, origin);
-
-      const headers = new Headers(corsHeaders(origin));
-      object.writeHttpMetadata(headers);
-      headers.set("etag", object.httpEtag);
-      headers.set("cache-control", "public, max-age=31536000");
-
-      return new Response(object.body, { headers });
     }
 
     // ── POST /api/upload ─────────────────────────────────────────────────────
