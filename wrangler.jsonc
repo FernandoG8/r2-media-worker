@@ -13,7 +13,14 @@
       "bucket_name": "paezandmore"
     }
   ],
+  "kv_namespaces": [
+    {
+      "binding": "CLIENTS_KV",
+      "id": "40efb89ad64745f98767e6b9b0067be6",
+      "preview_id": "2e9150a35c1a4fae86d4337ae51c39e2"
+    }
+  ],
   "vars": {
-    "ALLOWED_ORIGIN": "http://localhost:4321"
+    "ALLOWED_ORIGIN": "https://panel.mizcor.dev"
   }
 }
