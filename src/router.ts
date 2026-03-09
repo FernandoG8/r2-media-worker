@@ -1,5 +1,5 @@
 import type { Env } from './types';
-import { corsHeaders, json, getOrigin } from './cors';
+import { corsHeaders, json, resolveOrigin } from './cors';
 import { createS3Client } from './s3';
 import { listClients, getClient, getClientCredentials, createClient, deleteClient } from './clients';
 
@@ -8,7 +8,7 @@ function isAuthorized(request: Request, env: Env): boolean {
 }
 
 export async function handleRequest(request: Request, env: Env): Promise<Response> {
-  const origin = getOrigin(env);
+  const origin = resolveOrigin(request, env);
   const url = new URL(request.url);
   const method = request.method;
 
