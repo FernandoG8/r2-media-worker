@@ -84,6 +84,12 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       return json({ error: 'Missing required fields' }, 400, origin);
     }
 
+    // Sanitize endpoint: remove trailing slash and accidental bucketName suffix
+    const endpoint = body.endpoint
+      .trim()
+      .replace(/\/+$/, '')
+      .replace(new RegExp(`/${body.bucketName}$`), '');
+
     // Check if already exists
     const existing = await getClient(env.CLIENTS_KV, body.id);
     if (existing) return json({ error: 'Client already exists' }, 409, origin);
@@ -94,7 +100,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       {
         name: body.name,
         bucketName: body.bucketName,
-        endpoint: body.endpoint,
+        endpoint,
         r2BaseUrl: body.r2BaseUrl ?? '',
         active: true,
         createdAt: new Date().toISOString(),
