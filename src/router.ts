@@ -136,12 +136,8 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   const clientId = request.headers.get('X-Client-ID');
   if (!clientId) {
     // Only require X-Client-ID for media endpoints below
-    if (
-      url.pathname === '/api/list' ||
-      url.pathname === '/api/upload' ||
-      url.pathname === '/api/folder' ||
-      url.pathname === '/api/delete'
-    ) {
+    const mediaEndpoints = ['/api/list', '/api/upload', '/api/folder', '/api/delete', '/api/folders', '/api/rename', '/api/delete-recursive', '/api/rename-folder'];
+    if (mediaEndpoints.includes(url.pathname)) {
       return json({ error: 'Missing X-Client-ID header' }, 400, origin);
     }
     return json({ error: 'Not found' }, 404, origin);
@@ -248,6 +244,84 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
     await s3.s3Delete(client.bucketName, decodeURIComponent(key));
     return json({ deleted: key }, 200, origin);
+  }
+
+  // ── GET /api/folders — lista recursiva de todas las carpetas ────────────
+  if (method === 'GET' && url.pathname === '/api/folders') {
+    const allFolders: string[] = [];
+    const queue: string[] = [''];
+
+    while (queue.length > 0) {
+      const prefix = queue.shift()!;
+      let cursor: string | undefined;
+      do {
+        const result = await s3.s3List(client.bucketName, prefix, '/', 1000, cursor);
+        for (const folder of result.folders) {
+          allFolders.push(folder);
+          queue.push(folder);
+        }
+        cursor = result.nextContinuationToken ?? undefined;
+      } while (cursor);
+    }
+
+    return json({ folders: allFolders }, 200, origin);
+  }
+
+  // ── POST /api/rename — rename/move un archivo ──────────────────────────
+  if (method === 'POST' && url.pathname === '/api/rename') {
+    const { sourceKey, destKey } = await request.json<{ sourceKey: string; destKey: string }>();
+    if (!sourceKey || !destKey) return json({ error: 'Missing sourceKey or destKey' }, 400, origin);
+
+    await s3.s3Copy(client.bucketName, sourceKey, destKey);
+    await s3.s3Delete(client.bucketName, sourceKey);
+
+    const newUrl = `${url.origin}/file/${encodeURIComponent(clientId)}/${destKey.split('/').map(encodeURIComponent).join('/')}`;
+    return json({ ok: true, newKey: destKey, url: newUrl }, 200, origin);
+  }
+
+  // ── POST /api/delete-recursive — eliminar carpeta y contenido ──────────
+  if (method === 'POST' && url.pathname === '/api/delete-recursive') {
+    const { prefix: delPrefix } = await request.json<{ prefix: string }>();
+    if (!delPrefix) return json({ error: 'Missing prefix' }, 400, origin);
+
+    let deleted = 0;
+    let cursor: string | undefined;
+    do {
+      const result = await s3.s3List(client.bucketName, delPrefix, '', 1000, cursor);
+      for (const obj of result.objects) {
+        await s3.s3Delete(client.bucketName, obj.key);
+        deleted++;
+      }
+      cursor = result.nextContinuationToken ?? undefined;
+    } while (cursor);
+
+    // Delete the folder marker itself
+    try { await s3.s3Delete(client.bucketName, delPrefix); } catch {}
+    return json({ ok: true, deleted }, 200, origin);
+  }
+
+  // ── POST /api/rename-folder — renombrar carpeta (batch copy+delete) ────
+  if (method === 'POST' && url.pathname === '/api/rename-folder') {
+    const { oldPrefix, newPrefix } = await request.json<{ oldPrefix: string; newPrefix: string }>();
+    if (!oldPrefix || !newPrefix) return json({ error: 'Missing oldPrefix or newPrefix' }, 400, origin);
+
+    let moved = 0;
+    let cursor: string | undefined;
+    do {
+      const result = await s3.s3List(client.bucketName, oldPrefix, '', 1000, cursor);
+      for (const obj of result.objects) {
+        const newKey = newPrefix + obj.key.slice(oldPrefix.length);
+        await s3.s3Copy(client.bucketName, obj.key, newKey);
+        await s3.s3Delete(client.bucketName, obj.key);
+        moved++;
+      }
+      cursor = result.nextContinuationToken ?? undefined;
+    } while (cursor);
+
+    // Create new folder marker, delete old one
+    await s3.s3Put(client.bucketName, newPrefix, new ArrayBuffer(0), 'application/x-directory');
+    try { await s3.s3Delete(client.bucketName, oldPrefix); } catch {}
+    return json({ ok: true, moved }, 200, origin);
   }
 
   return json({ error: 'Not found' }, 404, origin);
