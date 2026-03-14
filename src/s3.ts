@@ -121,6 +121,16 @@ export function createS3Client(creds: ClientCredentials, endpoint: string) {
     if (!res.ok) throw new Error(`S3 PutObject failed: ${res.status}`);
   }
 
+  async function s3Copy(bucket: string, sourceKey: string, destKey: string): Promise<void> {
+    const encodedDest = destKey.split('/').map(encodeURIComponent).join('/');
+    const copySource = `/${bucket}/${sourceKey.split('/').map(encodeURIComponent).join('/')}`;
+    const res = await aws.fetch(`${endpoint}/${bucket}/${encodedDest}`, {
+      method: 'PUT',
+      headers: { 'x-amz-copy-source': copySource },
+    });
+    if (!res.ok) throw new Error(`S3 CopyObject failed: ${res.status}`);
+  }
+
   async function s3Delete(bucket: string, key: string): Promise<void> {
     const encodedKey = key.split('/').map(encodeURIComponent).join('/');
     const res = await aws.fetch(`${endpoint}/${bucket}/${encodedKey}`, {
@@ -129,5 +139,5 @@ export function createS3Client(creds: ClientCredentials, endpoint: string) {
     if (!res.ok && res.status !== 204) throw new Error(`S3 DeleteObject failed: ${res.status}`);
   }
 
-  return { s3List, s3Get, s3Put, s3Delete };
+  return { s3List, s3Get, s3Put, s3Delete, s3Copy };
 }
