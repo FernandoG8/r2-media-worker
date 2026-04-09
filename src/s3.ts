@@ -139,5 +139,44 @@ export function createS3Client(creds: ClientCredentials, endpoint: string) {
     if (!res.ok && res.status !== 204) throw new Error(`S3 DeleteObject failed: ${res.status}`);
   }
 
-  return { s3List, s3Get, s3Put, s3Delete, s3Copy };
+  /**
+   * HEAD request — returns object metadata without downloading content.
+   */
+  async function s3Head(bucket: string, key: string): Promise<Response> {
+    const encodedKey = key.split('/').map(encodeURIComponent).join('/');
+    return aws.fetch(`${endpoint}/${bucket}/${encodedKey}`, { method: 'HEAD' });
+  }
+
+  /**
+   * Copy an object to itself replacing only the metadata.
+   * The file content is NOT transferred — only the metadata headers change.
+   * Used to update Cache-Control on existing objects without re-uploading.
+   */
+  async function s3UpdateMetadata(
+    bucket: string,
+    key: string,
+    metadata: Record<string, string>,
+  ): Promise<void> {
+    const encodedKey = key.split('/').map(encodeURIComponent).join('/');
+    const copySource = `/${bucket}/${encodedKey}`;
+
+    // We need the original Content-Type because REPLACE clears all metadata.
+    const headRes = await s3Head(bucket, key);
+    const contentType = headRes.headers.get('content-type') ?? 'application/octet-stream';
+
+    const headers: Record<string, string> = {
+      'x-amz-copy-source': copySource,
+      'x-amz-metadata-directive': 'REPLACE',
+      'Content-Type': contentType,
+      ...metadata,
+    };
+
+    const res = await aws.fetch(`${endpoint}/${bucket}/${encodedKey}`, {
+      method: 'PUT',
+      headers,
+    });
+    if (!res.ok) throw new Error(`S3 UpdateMetadata failed: ${res.status}`);
+  }
+
+  return { s3List, s3Get, s3Put, s3Delete, s3Copy, s3Head, s3UpdateMetadata };
 }

@@ -137,7 +137,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   const clientId = request.headers.get('X-Client-ID');
   if (!clientId) {
     // Only require X-Client-ID for media endpoints below
-    const mediaEndpoints = ['/api/list', '/api/upload', '/api/folder', '/api/delete', '/api/folders', '/api/rename', '/api/delete-recursive', '/api/rename-folder', '/api/download-zip'];
+    const mediaEndpoints = ['/api/list', '/api/upload', '/api/folder', '/api/delete', '/api/folders', '/api/rename', '/api/delete-recursive', '/api/rename-folder', '/api/download-zip', '/api/update-cache-header'];
     if (mediaEndpoints.includes(url.pathname)) {
       return json({ error: 'Missing X-Client-ID header' }, 400, origin);
     }
@@ -381,6 +381,22 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     zipHeaders.set('content-disposition', `attachment; filename="${zipName}"`);
 
     return new Response(zipped, { status: 200, headers: zipHeaders });
+  }
+
+  // ── POST /api/update-cache-header ──────────────────────────────────────
+  // Body: { key: string }
+  // Copies the object to itself with Cache-Control: public, max-age=31536000, immutable.
+  // Uses S3 CopyObject with x-amz-metadata-directive: REPLACE — no content transfer.
+  // Call once per key from the browser (1 key = 2 subrequests: HEAD + PUT, well under 50).
+  if (method === 'POST' && url.pathname === '/api/update-cache-header') {
+    const body = await request.json<{ key: string }>();
+    if (!body.key) return json({ error: 'Missing key' }, 400, origin);
+
+    await s3.s3UpdateMetadata(client.bucketName, body.key, {
+      'Cache-Control': 'public, max-age=31536000, immutable',
+    });
+
+    return json({ ok: true, key: body.key }, 200, origin);
   }
 
   return json({ error: 'Not found' }, 404, origin);
