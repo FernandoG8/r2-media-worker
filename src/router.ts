@@ -356,14 +356,15 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     if (keys.length === 0) return json({ error: 'No files found' }, 404, origin);
 
     // Fetch all files from R2, then build the ZIP synchronously.
-    // zipSync avoids the write-ordering issues that corrupt ZIPs when using
-    // the streaming Zip class with an un-awaited TransformStream writer.
+    // We use env.BUCKET (R2 binding) instead of the S3 API because:
+    //   - S3 API calls count as subrequests (free plan limit: 50/invocation)
+    //   - R2 binding calls are internal and have no subrequest limit
     const entries: Record<string, Uint8Array> = {};
 
     for (const key of keys) {
-      const s3res = await s3.s3Get(client.bucketName, key);
-      if (!s3res.ok) continue;
-      const buffer = await s3res.arrayBuffer();
+      const obj = await env.BUCKET.get(key);
+      if (!obj) continue;
+      const buffer = await obj.arrayBuffer();
       entries[key] = new Uint8Array(buffer);
     }
 
@@ -375,11 +376,11 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     // wastes CPU with no size benefit.
     const zipped = zipSync(entries, { level: 0 });
 
-    const headers = new Headers(corsHeaders(origin));
-    headers.set('content-type', 'application/zip');
-    headers.set('content-disposition', `attachment; filename="${zipName}"`);
+    const zipHeaders = new Headers(corsHeaders(origin));
+    zipHeaders.set('content-type', 'application/zip');
+    zipHeaders.set('content-disposition', `attachment; filename="${zipName}"`);
 
-    return new Response(zipped, { status: 200, headers });
+    return new Response(zipped, { status: 200, headers: zipHeaders });
   }
 
   return json({ error: 'Not found' }, 404, origin);
