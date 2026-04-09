@@ -2,6 +2,7 @@ import type { Env } from './types';
 import { corsHeaders, json, resolveOrigin } from './cors';
 import { createS3Client } from './s3';
 import { listClients, getClient, getClientCredentials, createClient, deleteClient } from './clients';
+import { Zip, ZipPassThrough } from 'fflate';
 
 function isAuthorized(request: Request, env: Env): boolean {
   return request.headers.get('X-API-Key') === env.API_SECRET;
@@ -136,7 +137,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   const clientId = request.headers.get('X-Client-ID');
   if (!clientId) {
     // Only require X-Client-ID for media endpoints below
-    const mediaEndpoints = ['/api/list', '/api/upload', '/api/folder', '/api/delete', '/api/folders', '/api/rename', '/api/delete-recursive', '/api/rename-folder'];
+    const mediaEndpoints = ['/api/list', '/api/upload', '/api/folder', '/api/delete', '/api/folders', '/api/rename', '/api/delete-recursive', '/api/rename-folder', '/api/download-zip'];
     if (mediaEndpoints.includes(url.pathname)) {
       return json({ error: 'Missing X-Client-ID header' }, 400, origin);
     }
@@ -322,6 +323,78 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     await s3.s3Put(client.bucketName, newPrefix, new ArrayBuffer(0), 'application/x-directory');
     try { await s3.s3Delete(client.bucketName, oldPrefix); } catch {}
     return json({ ok: true, moved }, 200, origin);
+  }
+
+  // ── POST /api/download-zip ─────────────────────────────────────────────
+  // Body: { keys?: string[], prefix?: string, name?: string }
+  //   keys   → download these specific R2 keys
+  //   prefix → list all objects under prefix and download all (backup)
+  //   name   → ZIP filename (default: backup.zip)
+  if (method === 'POST' && url.pathname === '/api/download-zip') {
+    const body = await request.json<{ keys?: string[]; prefix?: string; name?: string }>();
+    const zipName = (body.name ?? 'backup').replace(/\.zip$/i, '') + '.zip';
+
+    // Resolve the list of keys to include
+    let keys: string[] = [];
+
+    if (Array.isArray(body.keys) && body.keys.length > 0) {
+      keys = body.keys;
+    } else if (typeof body.prefix === 'string') {
+      // List all objects recursively under the given prefix
+      let cursor: string | undefined;
+      do {
+        const result = await s3.s3List(client.bucketName, body.prefix, '', 1000, cursor);
+        for (const obj of result.objects) {
+          if (!obj.key.endsWith('/')) keys.push(obj.key); // skip folder markers
+        }
+        cursor = result.nextContinuationToken ?? undefined;
+      } while (cursor);
+    } else {
+      return json({ error: 'Provide keys[] or prefix' }, 400, origin);
+    }
+
+    if (keys.length === 0) return json({ error: 'No files found' }, 404, origin);
+
+    // Build ZIP via streaming TransformStream so the response doesn't need to
+    // be fully buffered before sending.
+    const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
+    const writer = writable.getWriter();
+
+    const zipper = new Zip((err, chunk, final) => {
+      if (err) { writer.abort(err); return; }
+      writer.write(chunk);
+      if (final) writer.close();
+    });
+
+    // Kick off zip building in the background (don't await — we return the
+    // readable stream immediately so the client starts receiving data).
+    (async () => {
+      try {
+        for (const key of keys) {
+          const s3res = await s3.s3Get(client.bucketName, key);
+          if (!s3res.ok || !s3res.body) continue;
+
+          const entry = new ZipPassThrough(key); // level 0 — images already compressed
+          zipper.add(entry);
+
+          const reader = s3res.body.getReader();
+          while (true) {
+            const { done, value } = await reader.read();
+            if (done) { entry.push(new Uint8Array(0), true); break; }
+            entry.push(value, false);
+          }
+        }
+        zipper.end();
+      } catch (e) {
+        writer.abort(e);
+      }
+    })();
+
+    const headers = new Headers(corsHeaders(origin));
+    headers.set('content-type', 'application/zip');
+    headers.set('content-disposition', `attachment; filename="${zipName}"`);
+
+    return new Response(readable, { status: 200, headers });
   }
 
   return json({ error: 'Not found' }, 404, origin);
