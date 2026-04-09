@@ -2,7 +2,7 @@ import type { Env } from './types';
 import { corsHeaders, json, resolveOrigin } from './cors';
 import { createS3Client } from './s3';
 import { listClients, getClient, getClientCredentials, createClient, deleteClient } from './clients';
-import { Zip, ZipPassThrough } from 'fflate';
+import { zipSync } from 'fflate';
 
 function isAuthorized(request: Request, env: Env): boolean {
   return request.headers.get('X-API-Key') === env.API_SECRET;
@@ -355,46 +355,31 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
     if (keys.length === 0) return json({ error: 'No files found' }, 404, origin);
 
-    // Build ZIP via streaming TransformStream so the response doesn't need to
-    // be fully buffered before sending.
-    const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
-    const writer = writable.getWriter();
+    // Fetch all files from R2, then build the ZIP synchronously.
+    // zipSync avoids the write-ordering issues that corrupt ZIPs when using
+    // the streaming Zip class with an un-awaited TransformStream writer.
+    const entries: Record<string, Uint8Array> = {};
 
-    const zipper = new Zip((err, chunk, final) => {
-      if (err) { writer.abort(err); return; }
-      writer.write(chunk);
-      if (final) writer.close();
-    });
+    for (const key of keys) {
+      const s3res = await s3.s3Get(client.bucketName, key);
+      if (!s3res.ok) continue;
+      const buffer = await s3res.arrayBuffer();
+      entries[key] = new Uint8Array(buffer);
+    }
 
-    // Kick off zip building in the background (don't await — we return the
-    // readable stream immediately so the client starts receiving data).
-    (async () => {
-      try {
-        for (const key of keys) {
-          const s3res = await s3.s3Get(client.bucketName, key);
-          if (!s3res.ok || !s3res.body) continue;
+    if (Object.keys(entries).length === 0) {
+      return json({ error: 'No files could be fetched from R2' }, 500, origin);
+    }
 
-          const entry = new ZipPassThrough(key); // level 0 — images already compressed
-          zipper.add(entry);
-
-          const reader = s3res.body.getReader();
-          while (true) {
-            const { done, value } = await reader.read();
-            if (done) { entry.push(new Uint8Array(0), true); break; }
-            entry.push(value, false);
-          }
-        }
-        zipper.end();
-      } catch (e) {
-        writer.abort(e);
-      }
-    })();
+    // level: 0 = store only — images are already compressed, re-compressing
+    // wastes CPU with no size benefit.
+    const zipped = zipSync(entries, { level: 0 });
 
     const headers = new Headers(corsHeaders(origin));
     headers.set('content-type', 'application/zip');
     headers.set('content-disposition', `attachment; filename="${zipName}"`);
 
-    return new Response(readable, { status: 200, headers });
+    return new Response(zipped, { status: 200, headers });
   }
 
   return json({ error: 'Not found' }, 404, origin);
