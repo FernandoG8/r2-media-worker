@@ -201,7 +201,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
     if (!file) return json({ error: 'No file provided' }, 400, origin);
 
-    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/svg+xml'];
+    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/svg+xml', 'image/avif'];
     if (!allowedTypes.includes(file.type)) {
       return json({ error: 'Only image files are allowed' }, 400, origin);
     }
