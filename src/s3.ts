@@ -111,11 +111,12 @@ export function createS3Client(creds: ClientCredentials, endpoint: string) {
     key: string,
     body: ArrayBuffer | ReadableStream,
     contentType: string,
+    extraHeaders?: Record<string, string>,
   ): Promise<void> {
     const encodedKey = key.split('/').map(encodeURIComponent).join('/');
     const res = await aws.fetch(`${endpoint}/${bucket}/${encodedKey}`, {
       method: 'PUT',
-      headers: { 'Content-Type': contentType },
+      headers: { 'Content-Type': contentType, ...extraHeaders },
       body,
     });
     if (!res.ok) throw new Error(`S3 PutObject failed: ${res.status}`);
