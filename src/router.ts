@@ -213,7 +213,20 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     const buffer = await file.arrayBuffer();
     const key = `${prefix}${file.name}`;
 
-    await s3.s3Put(client.bucketName, key, buffer, file.type || 'application/octet-stream');
+    // Optional Cache-Control header forwarded from the upload form.
+    // The value is allowlisted to prevent arbitrary header injection.
+    const rawCacheControl = formData.get('cache-control') as string | null;
+    const ALLOWED_CACHE_VALUES = new Set([
+      'public, max-age=31536000, immutable',
+      'public, max-age=15768000, immutable',
+      'public, max-age=2592000, immutable',
+    ]);
+    const extraHeaders: Record<string, string> = {};
+    if (rawCacheControl && ALLOWED_CACHE_VALUES.has(rawCacheControl)) {
+      extraHeaders['Cache-Control'] = rawCacheControl;
+    }
+
+    await s3.s3Put(client.bucketName, key, buffer, file.type || 'application/octet-stream', extraHeaders);
 
     return json(
       {
@@ -384,19 +397,25 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   }
 
   // ── POST /api/update-cache-header ──────────────────────────────────────
-  // Body: { key: string }
-  // Copies the object to itself with Cache-Control: public, max-age=31536000, immutable.
+  // Body: { key: string, maxAge?: number }
+  // Copies the object to itself replacing the Cache-Control header.
+  // maxAge defaults to 31536000 (1 year) when omitted for backward compatibility.
   // Uses S3 CopyObject with x-amz-metadata-directive: REPLACE — no content transfer.
   // Call once per key from the browser (1 key = 2 subrequests: HEAD + PUT, well under 50).
   if (method === 'POST' && url.pathname === '/api/update-cache-header') {
-    const body = await request.json<{ key: string }>();
+    const body = await request.json<{ key: string; maxAge?: number }>();
     if (!body.key) return json({ error: 'Missing key' }, 400, origin);
 
+    const ALLOWED_MAX_AGES = new Set([31536000, 15768000, 2592000]);
+    const maxAge = typeof body.maxAge === 'number' && ALLOWED_MAX_AGES.has(body.maxAge)
+      ? body.maxAge
+      : 31536000;
+
     await s3.s3UpdateMetadata(client.bucketName, body.key, {
-      'Cache-Control': 'public, max-age=31536000, immutable',
+      'Cache-Control': `public, max-age=${maxAge}, immutable`,
     });
 
-    return json({ ok: true, key: body.key }, 200, origin);
+    return json({ ok: true, key: body.key, maxAge }, 200, origin);
   }
 
   return json({ error: 'Not found' }, 404, origin);
