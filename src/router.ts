@@ -1,7 +1,7 @@
 import type { Env } from './types';
 import { corsHeaders, json, resolveOrigin } from './cors';
 import { createS3Client } from './s3';
-import { listClients, getClient, getClientCredentials, createClient, deleteClient } from './clients';
+import { listClients, getClient, getClientCredentials, createClient, deleteClient, updateClientConfig } from './clients';
 import { zipSync } from 'fflate';
 
 function isAuthorized(request: Request, env: Env): boolean {
@@ -79,6 +79,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       r2BaseUrl: string;
       accessKeyId: string;
       secretAccessKey: string;
+      env?: 'prod' | 'test';
     }>();
 
     if (!body.id || !body.name || !body.bucketName || !body.endpoint || !body.accessKeyId || !body.secretAccessKey) {
@@ -105,12 +106,38 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         r2BaseUrl: body.r2BaseUrl ?? '',
         active: true,
         createdAt: new Date().toISOString(),
+        env: body.env ?? 'test',
       },
       { accessKeyId: body.accessKeyId, secretAccessKey: body.secretAccessKey },
       env.MASTER_KEY,
     );
 
     return json({ id: body.id, name: body.name }, 201, origin);
+  }
+
+  // PATCH /api/clients/:id — update mutable fields (env) without re-entering credentials
+  if (method === 'PATCH' && url.pathname.startsWith('/api/clients/')) {
+    if (!isAuthorized(request, env)) return json({ error: 'Unauthorized' }, 401, origin);
+
+    const clientId = decodeURIComponent(url.pathname.slice('/api/clients/'.length));
+    if (!clientId) return json({ error: 'Missing client ID' }, 400, origin);
+
+    const existing = await getClient(env.CLIENTS_KV, clientId);
+    if (!existing) return json({ error: 'Client not found' }, 404, origin);
+
+    const body = await request.json<{ env?: string; name?: string; r2BaseUrl?: string }>();
+
+    const updates: Parameters<typeof updateClientConfig>[2] = {};
+    if (body.env === 'prod' || body.env === 'test') updates.env = body.env;
+    if (typeof body.name === 'string' && body.name.trim()) updates.name = body.name.trim();
+    if (typeof body.r2BaseUrl === 'string') updates.r2BaseUrl = body.r2BaseUrl.trim();
+
+    if (Object.keys(updates).length === 0) {
+      return json({ error: 'No valid fields to update' }, 400, origin);
+    }
+
+    await updateClientConfig(env.CLIENTS_KV, clientId, updates);
+    return json({ id: clientId, ...updates }, 200, origin);
   }
 
   // DELETE /api/clients/:id
@@ -213,7 +240,20 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     const buffer = await file.arrayBuffer();
     const key = `${prefix}${file.name}`;
 
-    await s3.s3Put(client.bucketName, key, buffer, file.type || 'application/octet-stream');
+    // Optional Cache-Control header forwarded from the upload form.
+    // The value is allowlisted to prevent arbitrary header injection.
+    const rawCacheControl = formData.get('cache-control') as string | null;
+    const ALLOWED_CACHE_VALUES = new Set([
+      'public, max-age=31536000, immutable',
+      'public, max-age=15768000, immutable',
+      'public, max-age=2592000, immutable',
+    ]);
+    const extraHeaders: Record<string, string> = {};
+    if (rawCacheControl && ALLOWED_CACHE_VALUES.has(rawCacheControl)) {
+      extraHeaders['Cache-Control'] = rawCacheControl;
+    }
+
+    await s3.s3Put(client.bucketName, key, buffer, file.type || 'application/octet-stream', extraHeaders);
 
     return json(
       {
@@ -242,6 +282,19 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   if (method === 'DELETE' && url.pathname === '/api/delete') {
     const key = url.searchParams.get('key');
     if (!key) return json({ error: 'No key provided' }, 400, origin);
+
+    // Production buckets require the caller to confirm the exact filename
+    if ((client.env ?? 'prod') !== 'test') {
+      const confirmedName = request.headers.get('X-Confirmed-Name');
+      const expectedName = decodeURIComponent(key).split('/').pop() ?? '';
+      if (!confirmedName || confirmedName !== expectedName) {
+        return json(
+          { error: 'Production bucket: X-Confirmed-Name header must match the filename' },
+          412,
+          origin,
+        );
+      }
+    }
 
     await s3.s3Delete(client.bucketName, decodeURIComponent(key));
     return json({ deleted: key }, 200, origin);
@@ -284,6 +337,19 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   if (method === 'POST' && url.pathname === '/api/delete-recursive') {
     const { prefix: delPrefix } = await request.json<{ prefix: string }>();
     if (!delPrefix) return json({ error: 'Missing prefix' }, 400, origin);
+
+    // Production buckets require the caller to confirm the exact folder name
+    if ((client.env ?? 'prod') !== 'test') {
+      const confirmedName = request.headers.get('X-Confirmed-Name');
+      const expectedName = delPrefix.replace(/\/$/, '').split('/').pop() ?? '';
+      if (!confirmedName || confirmedName !== expectedName) {
+        return json(
+          { error: 'Production bucket: X-Confirmed-Name header must match the folder name' },
+          412,
+          origin,
+        );
+      }
+    }
 
     let deleted = 0;
     let cursor: string | undefined;
@@ -384,19 +450,25 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   }
 
   // ── POST /api/update-cache-header ──────────────────────────────────────
-  // Body: { key: string }
-  // Copies the object to itself with Cache-Control: public, max-age=31536000, immutable.
+  // Body: { key: string, maxAge?: number }
+  // Copies the object to itself replacing the Cache-Control header.
+  // maxAge defaults to 31536000 (1 year) when omitted for backward compatibility.
   // Uses S3 CopyObject with x-amz-metadata-directive: REPLACE — no content transfer.
   // Call once per key from the browser (1 key = 2 subrequests: HEAD + PUT, well under 50).
   if (method === 'POST' && url.pathname === '/api/update-cache-header') {
-    const body = await request.json<{ key: string }>();
+    const body = await request.json<{ key: string; maxAge?: number }>();
     if (!body.key) return json({ error: 'Missing key' }, 400, origin);
 
+    const ALLOWED_MAX_AGES = new Set([31536000, 15768000, 2592000]);
+    const maxAge = typeof body.maxAge === 'number' && ALLOWED_MAX_AGES.has(body.maxAge)
+      ? body.maxAge
+      : 31536000;
+
     await s3.s3UpdateMetadata(client.bucketName, body.key, {
-      'Cache-Control': 'public, max-age=31536000, immutable',
+      'Cache-Control': `public, max-age=${maxAge}, immutable`,
     });
 
-    return json({ ok: true, key: body.key }, 200, origin);
+    return json({ ok: true, key: body.key, maxAge }, 200, origin);
   }
 
   return json({ error: 'Not found' }, 404, origin);

@@ -16,8 +16,8 @@ export function resolveOrigin(request: Request, env: Env): string {
 export function corsHeaders(origin: string) {
   return {
     'Access-Control-Allow-Origin': origin,
-    'Access-Control-Allow-Methods': 'GET, POST, DELETE, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, X-API-Key, X-Client-ID',
+    'Access-Control-Allow-Methods': 'GET, POST, DELETE, PATCH, OPTIONS',
+    'Access-Control-Allow-Headers': 'Content-Type, X-API-Key, X-Client-ID, X-Confirmed-Name',
     'Vary': 'Origin',
   };
 }

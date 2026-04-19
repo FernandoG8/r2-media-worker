@@ -13,6 +13,7 @@ export interface ClientConfig {
   r2BaseUrl: string;         // URL pública base para enlaces
   active: boolean;
   createdAt: string;
+  env?: 'prod' | 'test';     // missing = prod (fail-safe default)
 }
 
 export interface ClientCredentials {
