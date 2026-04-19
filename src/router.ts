@@ -1,7 +1,7 @@
 import type { Env } from './types';
 import { corsHeaders, json, resolveOrigin } from './cors';
 import { createS3Client } from './s3';
-import { listClients, getClient, getClientCredentials, createClient, deleteClient } from './clients';
+import { listClients, getClient, getClientCredentials, createClient, deleteClient, updateClientConfig } from './clients';
 import { zipSync } from 'fflate';
 
 function isAuthorized(request: Request, env: Env): boolean {
@@ -79,6 +79,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       r2BaseUrl: string;
       accessKeyId: string;
       secretAccessKey: string;
+      env?: 'prod' | 'test';
     }>();
 
     if (!body.id || !body.name || !body.bucketName || !body.endpoint || !body.accessKeyId || !body.secretAccessKey) {
@@ -105,12 +106,38 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
         r2BaseUrl: body.r2BaseUrl ?? '',
         active: true,
         createdAt: new Date().toISOString(),
+        env: body.env ?? 'test',
       },
       { accessKeyId: body.accessKeyId, secretAccessKey: body.secretAccessKey },
       env.MASTER_KEY,
     );
 
     return json({ id: body.id, name: body.name }, 201, origin);
+  }
+
+  // PATCH /api/clients/:id — update mutable fields (env) without re-entering credentials
+  if (method === 'PATCH' && url.pathname.startsWith('/api/clients/')) {
+    if (!isAuthorized(request, env)) return json({ error: 'Unauthorized' }, 401, origin);
+
+    const clientId = decodeURIComponent(url.pathname.slice('/api/clients/'.length));
+    if (!clientId) return json({ error: 'Missing client ID' }, 400, origin);
+
+    const existing = await getClient(env.CLIENTS_KV, clientId);
+    if (!existing) return json({ error: 'Client not found' }, 404, origin);
+
+    const body = await request.json<{ env?: string; name?: string; r2BaseUrl?: string }>();
+
+    const updates: Parameters<typeof updateClientConfig>[2] = {};
+    if (body.env === 'prod' || body.env === 'test') updates.env = body.env;
+    if (typeof body.name === 'string' && body.name.trim()) updates.name = body.name.trim();
+    if (typeof body.r2BaseUrl === 'string') updates.r2BaseUrl = body.r2BaseUrl.trim();
+
+    if (Object.keys(updates).length === 0) {
+      return json({ error: 'No valid fields to update' }, 400, origin);
+    }
+
+    await updateClientConfig(env.CLIENTS_KV, clientId, updates);
+    return json({ id: clientId, ...updates }, 200, origin);
   }
 
   // DELETE /api/clients/:id
@@ -256,6 +283,19 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     const key = url.searchParams.get('key');
     if (!key) return json({ error: 'No key provided' }, 400, origin);
 
+    // Production buckets require the caller to confirm the exact filename
+    if ((client.env ?? 'prod') !== 'test') {
+      const confirmedName = request.headers.get('X-Confirmed-Name');
+      const expectedName = decodeURIComponent(key).split('/').pop() ?? '';
+      if (!confirmedName || confirmedName !== expectedName) {
+        return json(
+          { error: 'Production bucket: X-Confirmed-Name header must match the filename' },
+          412,
+          origin,
+        );
+      }
+    }
+
     await s3.s3Delete(client.bucketName, decodeURIComponent(key));
     return json({ deleted: key }, 200, origin);
   }
@@ -297,6 +337,19 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   if (method === 'POST' && url.pathname === '/api/delete-recursive') {
     const { prefix: delPrefix } = await request.json<{ prefix: string }>();
     if (!delPrefix) return json({ error: 'Missing prefix' }, 400, origin);
+
+    // Production buckets require the caller to confirm the exact folder name
+    if ((client.env ?? 'prod') !== 'test') {
+      const confirmedName = request.headers.get('X-Confirmed-Name');
+      const expectedName = delPrefix.replace(/\/$/, '').split('/').pop() ?? '';
+      if (!confirmedName || confirmedName !== expectedName) {
+        return json(
+          { error: 'Production bucket: X-Confirmed-Name header must match the folder name' },
+          412,
+          origin,
+        );
+      }
+    }
 
     let deleted = 0;
     let cursor: string | undefined;

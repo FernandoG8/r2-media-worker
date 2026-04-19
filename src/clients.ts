@@ -52,6 +52,17 @@ export async function createClient(
   }
 }
 
+export async function updateClientConfig(
+  kv: KVNamespace,
+  id: string,
+  updates: Partial<ClientConfig>,
+): Promise<void> {
+  const raw = await kv.get(`client:${id}`);
+  if (!raw) throw new Error('Client not found');
+  const existing: ClientConfig = JSON.parse(raw);
+  await kv.put(`client:${id}`, JSON.stringify({ ...existing, ...updates }));
+}
+
 export async function deleteClient(kv: KVNamespace, id: string): Promise<void> {
   await kv.delete(`client:${id}`);
   await kv.delete(`creds:${id}`);
