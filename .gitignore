@@ -165,3 +165,8 @@ dist
 .env*
 !.env.example
 .wrangler/
+
+# Local context/tooling (never tracked)
+CONTEXT_*.md
+.codex
+.codex/
