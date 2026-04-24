@@ -4,7 +4,7 @@ import { createS3Client } from './s3';
 import { listClients, getClient, getClientCredentials, createClient, deleteClient, updateClientConfig } from './clients';
 import { zipSync } from 'fflate';
 
-function isAuthorized(request: Request, env: Env): boolean {
+export function isAuthorized(request: Request, env: Env): boolean {
   return request.headers.get('X-API-Key') === env.API_SECRET;
 }
 
