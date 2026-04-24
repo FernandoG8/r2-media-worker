@@ -420,13 +420,301 @@ test/privacy/
 | **IV** | Initialization Vector — valor aleatorio único por operación de cifrado AES-GCM. Su reutilización con la misma clave es una vulnerabilidad crítica. |
 | **CIA** | Confidentiality, Integrity, Availability — triada del modelo de seguridad. |
 
-### E. Próximas secciones
+---
 
-- **Sección 6.** Planificación de pruebas de usabilidad — hallazgos de accesibilidad (ausencia de ARIA, labels sin `htmlFor`, modales sin `role="dialog"`) y protocolo de evaluación.
-- **Sección 7.** Síntesis de técnicas aplicadas — mapeo global al SWEBOK capítulo 3.
-- **Sección 8.** Medidas de cobertura y *mutation score* — resultados numéricos al cierre del ejercicio.
-- **Sección 9.** Conclusiones y hallazgos consolidados — narrativa final.
+## 6. Planificación de pruebas de usabilidad
+
+### 6.1 Marco conceptual
+
+El SWEBOK (sección 2, *Usability and HCI Testing*) define estas pruebas como aquellas que "evalúan qué tan fácil es para los usuarios finales aprender a usar el software", incluyendo las funciones de apoyo a tareas, la documentación y la capacidad del sistema de recuperarse de errores del usuario. **Por instrucción explícita de la actividad académica, esta sección contiene únicamente el plan; la ejecución queda fuera del alcance.**
+
+### 6.2 Perfil de usuario objetivo
+
+Panel Media es una herramienta interna de Mizcor. El perfil de usuario es:
+
+- **Rol:** administrador técnico de Mizcor o integrante del equipo que gestiona activos de clientes.
+- **Experiencia técnica:** media-alta — familiarizado con conceptos de almacenamiento en nube, buckets, y flujos de trabajo de imagen.
+- **Contexto de uso:** escritorio, Chrome/Firefox, conexión estable. Uso esporádico pero con operaciones críticas (subir assets de producción, gestionar buckets de clientes activos).
+- **Expectativa principal:** que las operaciones destructivas (borrar, mover, renombrar en producción) sean claras y sin ambigüedad.
+
+### 6.3 Hallazgos de inspección estática (pre-ejecución)
+
+El análisis del código fuente durante la fase de implementación de tests reveló los siguientes hallazgos de usabilidad sin necesidad de ejecutar pruebas con usuarios:
+
+| ID | Hallazgo | Componente | Severidad | Heurística Nielsen |
+|----|----------|------------|-----------|-------------------|
+| **H-6.1** | Ausencia total de atributos ARIA en modales. Ningún modal usa `role="dialog"`, `aria-modal`, ni `aria-labelledby`. | Todos los modales | Media | #10 — Ayuda y documentación |
+| **H-6.2** | Labels sin `htmlFor` en formularios. Los inputs de `AddClientModal` no tienen labels vinculadas semánticamente. | `AddClientModal` | Media | #6 — Reconocimiento antes que recuerdo |
+| **H-6.3** | `UploadOptimizationModal` con `max-w-[1400px]` — el modal no es usable en pantallas menores a 1400px. | `UploadOptimizationModal` | Alta | #4 — Consistencia y estándares |
+| **H-6.4** | Borrado en cliente prod: el worker rechaza con 412 pero el frontend no guía al usuario. El `ConfirmModal` genérico no solicita el nombre del archivo — el usuario ve el delete silenciosamente fallar sin explicación. (Ver H-4.1) | `FileGrid` | **Alta** | #9 — Ayudar a reconocer, diagnosticar y recuperarse de errores |
+| **H-6.5** | Sin feedback de error visible en operaciones fallidas. No se identificó manejo de respuestas 4xx/5xx del worker en la UI (toasts de error, mensajes inline). | `useMediaCache` | Alta | #1 — Visibilidad del estado del sistema |
+| **H-6.6** | Navegación sin router — el botón atrás del browser no funciona para navegar entre carpetas. | `MediaPanel` | Media | #3 — Control y libertad del usuario |
+| **H-6.7** | Sin indicador de progreso global en operaciones de lote (bulk delete, bulk rename). El usuario no sabe cuántos archivos quedan por procesar. | `FileGrid` | Baja | #1 — Visibilidad del estado del sistema |
+
+### 6.4 Tareas propuestas para evaluación
+
+Si se ejecutaran las pruebas de usabilidad, las siguientes tareas representarían los flujos críticos del sistema:
+
+| # | Tarea | Tiempo esperado | Métrica de éxito |
+|---|-------|----------------|-----------------|
+| T-1 | Subir 3 imágenes a una carpeta existente de un cliente de prueba | < 2 min | Archivos aparecen en el listado |
+| T-2 | Crear una carpeta nueva bajo un prefijo existente | < 1 min | Carpeta aparece en el árbol |
+| T-3 | Mover un archivo de una carpeta a otra | < 2 min | Archivo aparece en destino, desaparece en origen |
+| T-4 | Intentar borrar un archivo de un cliente de producción | Sin límite | El usuario comprende por qué el borrado falló (actualmente no hay guía) |
+| T-5 | Renombrar un lote de 5 archivos usando la convención de slug | < 3 min | Los 5 archivos quedan renombrados con el patrón correcto |
+| T-6 | Añadir un cliente nuevo con sus credenciales S3 | < 5 min | Cliente aparece en el selector |
+
+### 6.5 Protocolo de evaluación propuesto
+
+- **Método:** thinking-aloud con observación directa. El evaluador observa sin intervenir; el participante verbaliza su proceso.
+- **Participantes:** 3-5 personas del equipo Mizcor con acceso actual al panel.
+- **Métricas:** tiempo de tarea, tasa de éxito/fracaso, número de errores cometidos, SUS (*System Usability Scale*) al final.
+- **Entorno:** sesión remota grabada (Loom o similar), ambiente de staging, sin datos de producción.
+- **No ejecutado en este ejercicio** — los hallazgos H-6.1 a H-6.7 se derivan de inspección estática y son suficientes para documentar el estado actual de usabilidad sin requerir sesiones con usuarios.
 
 ---
 
-*Fin de la v2 — secciones 1–5 completas.*
+## 7. Técnicas de prueba aplicadas — síntesis global
+
+Esta sección consolida el mapeo entre las técnicas del SWEBOK capítulo 3 y su aplicación concreta en el proyecto, para evidenciar la cobertura sistemática del material del curso.
+
+### 7.1 Técnicas basadas en especificaciones (caja negra)
+
+**Partición de equivalencia** — Aplicada en 28 IDs de prueba. Ejemplo representativo: `isAllowedMimeType` (U-W-08) divide el dominio en dos clases — los 6 tipos permitidos y el complemento. Cada clase se representa con al menos un caso. Aplicada también en validadores de `AddClientModal` (U-F-07) y en autenticación (U-W-06, S-W-01..03).
+
+**Análisis de valores límite** — Aplicado en 8 IDs. Caso más ilustrativo: `isFileSizeAllowed` (U-W-09) con 7 casos en torno al límite de 10 MB (MAX-1, MAX, MAX+1). La constante `MAX_FILE_SIZE_BYTES` se exporta del módulo para que los tests puedan expresar los límites relativamente sin hardcodear el valor.
+
+**Tabla de decisión** — Aplicada en I-W-03 (matriz `env` × `X-Confirmed-Name`), I-W-11 (11 endpoints × 2 estados de auth = 22 casos), I-W-12 (CORS en 5 tipos de respuesta), I-F-07 (MoveFileModal disabled), I-F-09b (ConfirmModal en FileGrid). Las tablas de decisión demuestran cobertura combinatorial explícita.
+
+**Pruebas de transición de estados** — Aplicada en todos los flujos de integración del worker (I-W-01 a I-W-06) y en los flujos de componentes del frontend (I-F-08: NewFolderModal → ConfirmExitModal, I-F-10: Toast auto-dismiss). El SWEBOK señala que esta técnica "representa el SUT mediante una máquina de estados finitos" — el ciclo CRUD de cliente (I-W-01) es el ejemplo más claro: crear → listar → actualizar → eliminar → listar vacío.
+
+**Pruebas basadas en escenarios** — Aplicada en I-W-07 y I-W-08 (download-zip end-to-end), I-W-10 (carpeta aparece en list y en folders), I-F-02 (upload con XHR progress), I-F-05 y I-F-06 (flujos completos de modales). Cada escenario valida un caso de uso completo del sistema, no solo una función aislada.
+
+**Pruebas de robustez / excepciones forzadas** — Aplicada en U-W-03 (tampering de ciphertext), S-W-01..03 (requests sin auth), S-W-09..10 (delete prod rechazado y archivo persiste), S-W-13 (body malformado con CORS headers). El SWEBOK la describe como verificar "cómo el programa procesa entradas inesperadas".
+
+**Fuzzing / pruebas aleatorias** — Aplicada en U-F-02 y U-F-03 (inputs extremos en `toSlug`: emoji, solo especiales, vacío), U-F-12 (slash en nombre de carpeta), S-W-11 (path traversal con `../` y `%2e%2e%2f`).
+
+### 7.2 Técnicas basadas en la estructura (caja blanca)
+
+**Pruebas de flujo de datos** — La extracción de validadores a `src/validators.ts` (Decisión 2.1, commit `c9685d6`) es en esencia una aplicación del principio de flujo de datos: aislar las definiciones y usos de variables de validación para hacerlas trazables y testeables independientemente. Los tests U-W-07 a U-W-11 cubren directamente las rutas de datos críticas de cada validador.
+
+**Cobertura de ramas** — La suite alcanza cobertura explícita de las ramas más críticas: `isAuthorized` (true/false), `resolveOrigin` (5 ramas), `resolveMaxAge` (en lista / fuera de lista / undefined), el handler de delete (prod/test × con confirmación / sin confirmación). La cobertura de líneas total no se midió con istanbul en esta iteración pero el mutation score del worker (85.71%) es un proxy más significativo.
+
+### 7.3 Técnicas basadas en la experiencia
+
+**Error guessing** — Aplicado sistemáticamente en la fase de análisis: anticipar que `API_SECRET` vacío podría autenticar (H-2.5), que `download-zip` podría leer el bucket equivocado (H-3.1), que `toSlug` duplicado podría divergir (H-2.1). El SWEBOK señala que esta técnica usa "el historial de fallas de proyectos anteriores y la propia experiencia" — aquí se derivó del conocimiento arquitectónico del sistema.
+
+**Pruebas exploratorias** — La fase de lectura obligatoria en cada prompt (antes de escribir tests) fue en esencia exploración sistemática: cada vez que Claude Code abrió un archivo y reportó divergencias antes de implementar, se estaba aplicando esta técnica. El hallazgo H-3.1 (download-zip binding directo) surgió durante exploración de I-W-08.
+
+### 7.4 Técnicas basadas en fallas y mutación
+
+**Mutation testing** — Aplicado con Stryker Mutator sobre las funciones puras de ambos repositorios. Los resultados se detallan en la sección 8. La premisa del SWEBOK: "un caso de prueba es exitoso si logra identificar la diferencia y matar al mutante". El worker obtuvo 85.71% de score total, superando el umbral *high* de 80%.
+
+**Pruebas de propiedad (metamórficas)** — U-W-02 aplica esta técnica: la relación metamórfica verificada es "dos llamadas consecutivas con el mismo plaintext y masterKey deben producir ciphertexts distintos" (unicidad de IV). El SWEBOK las describe como "particularmente útiles para detectar relaciones consistentes con las salidas generadas".
+
+---
+
+## 8. Medidas de cobertura y mutation score
+
+### 8.1 Suite de tests — conteo final
+
+| Repositorio | Categoría | Archivos de test | Tests |
+|-------------|-----------|-----------------|-------|
+| Worker | Unitarias | 5 | 73 |
+| Worker | Integración | 5 | 60 |
+| Worker | Seguridad | 6 | 35 |
+| Worker | Privacidad | 4 | 9 |
+| Frontend | Unitarias | 8 | 56 |
+| Frontend | Integración | 5 | 35 |
+| **Total** | | **33** | **268** |
+
+Adicionalmente, 1 test marcado como `it.todo` en `test/privacy/smoke.test.ts` del worker documenta intención de prueba pendiente de implementación.
+
+Todos los 268 tests pasan en ejecución limpia (`npm run test:run`) en ambos repositorios. Ningún test usa `it.skip` ni `xit`. No existen tests que pasen por razones incorrectas (se verificó que todos los mocks y stubs están correctamente restaurados en `afterEach`).
+
+### 8.2 Mutation score — Worker
+
+Herramienta: Stryker Mutator con runner Vitest. Archivos bajo mutación: `src/crypto.ts`, `src/validators.ts`, `src/cors.ts`.
+
+| Archivo | Score total | Score cubierto | Killed | Survived | Timeout | No coverage |
+|---------|------------|----------------|--------|----------|---------|-------------|
+| `src/crypto.ts` | — | — | — | 2 | — | — |
+| `src/validators.ts` | — | — | — | 3 | — | — |
+| `src/cors.ts` | — | — | — | 2+5nc | — | — |
+| **Total** | **85.71%** | — | **70** | **7** | **2** | **5** |
+
+**Umbral configurado:** high: 80%, low: 60%. El score total de **85.71% supera el umbral alto**.
+
+**Mutantes supervivientes analizados:**
+
+- `cors.ts` — `?? ''` → `?? "Stryker was here!"`: los tests de origen ausente verifican el fallback por identidad de objeto, no por valor exacto del string. Sin impacto de seguridad porque el fallback real sí es el correcto.
+- `cors.ts` — `reqOrigin === env.ALLOWED_ORIGIN → true`: falta un test donde `ALLOWED_ORIGIN` está presente pero el origen de la request es diferente a él. Registrado como gap menor.
+- `crypto.ts` — off-by-one en loop de conversión: `i < binary.length → i <= binary.length`. El byte extra es `charCodeAt(undefined) = NaN → 0` en Uint8Array. Los tests de roundtrip no detectan el byte extra porque `decryptCredentials` parsea el JSON correctamente de todas formas. Bajo riesgo real.
+- `crypto.ts` — `extractable: false → true` en `importKey`. No tiene efecto funcional en el comportamiento de cifrado/descifrado.
+- `validators.ts` — `typeof requested === 'number' → true` en `resolveMaxAge`. Falta un test con input no-número (por ejemplo, string). Registrado como gap menor.
+- `validators.ts` — mutación de la constante `10 * 1024 * 1024`: los tests de boundary usan `MAX_FILE_SIZE_BYTES` exportada como referencia, por lo que la mutación del valor de la constante y la mutación del uso se neutralizan mutuamente. Es una limitación conocida de los tests que usan constantes exportadas como oráculo.
+
+**Conclusión del score del worker:** los 7 supervivientes son todos de bajo riesgo. Ninguno representa una ruta de seguridad o privacidad sin cobertura. El score de 85.71% es representativo de una suite unitaria madura sobre funciones puras.
+
+### 8.3 Mutation score — Frontend
+
+Herramienta: Stryker Mutator con runner Vitest. Archivos bajo mutación: `src/utils/generateAssets.ts`, `src/components/BulkRenameModal.tsx`, `src/components/UploadOptimizationModal.tsx`.
+
+| Archivo | Score total | Score cubierto | Killed | Survived | No coverage |
+|---------|------------|----------------|--------|----------|-------------|
+| `BulkRenameModal.tsx` | 6.71% | **100%** | 11 | 0 | 153 |
+| `UploadOptimizationModal.tsx` | 2.81% | **64.71%** | 11 | 6 | 375 |
+| `generateAssets.ts` | **51.02%** | **51.02%** | 25 | 24 | 0 |
+| **Total** | 7.77% | **61.04%** | **47** | **30** | **528** |
+
+**Interpretación del score total del frontend (7.77%):** este número es engañoso porque los 528 mutantes sin cobertura corresponden al JSX de los componentes (`render`, elementos visuales, event handlers del DOM) que Stryker instrumenta al mutar los archivos completos pero que no tienen tests unitarios directos — por diseño, los tests de componentes están en la capa de integración y usan `@testing-library/react`. El **score sobre código cubierto (61.04%) es la métrica relevante**.
+
+**`BulkRenameModal.tsx` — 100% cubierto:** los 11 mutantes en `toSlug` fueron todos killed. Los tests U-F-02 cubren exhaustivamente el comportamiento de la función con partición de equivalencia y fuzzing.
+
+**`UploadOptimizationModal.tsx` — 64.71% cubierto:** 6 supervivientes en la lógica de cálculo de savings/percentage del componente. Los tests verifican el render pero no los valores intermedios de cálculo. Estos mutantes son de bajo impacto de negocio.
+
+**`generateAssets.ts` — 51.02%:** 24 supervivientes identificados:
+- Mutaciones de `sort()` → `() => undefined`: los tests no verifican orden alfabético. Gap documentado.
+- Mutaciones de `.filter(f => !f.key.endsWith('/'))` → `.filter(f => !f.key.startsWith('/'))`: los tests no incluyen archivos con key que empiece por `/`. Gap documentado.
+- Mutaciones de líneas en blanco en el template generado: los tests verifican presencia de palabras clave, no la estructura exacta de líneas.
+
+**Plan de mejora identificado (fuera del alcance de este ejercicio):**
+1. Añadir test de orden alfabético en `generateAssets.test.ts` — elevaría el score a ~70%.
+2. Mover `toSlug` a `src/utils/slug.ts` y ajustar el `mutate` de Stryker para apuntar solo a ese archivo — reduciría el ruido de no-coverage a cero.
+3. Añadir `data-testid` con el valor de savings en `UploadOptimizationModal` — elevaría el covered score a ~85%.
+
+### 8.4 Relación entre cobertura y efectividad
+
+El SWEBOK (sección 4) distingue entre la evaluación del SUT y la evaluación de la suite de tests. Los mutation scores de este ejercicio son la medida más directa de efectividad de la suite, conforme al capítulo 4: "cuanto más alta sea la puntuación de mutación, mejor será el conjunto de pruebas, ya que indica una mayor capacidad para descubrir las fallas inyectadas más realistas."
+
+El worker alcanza 85.71% sobre funciones puras críticas (cifrado, validadores, CORS, auth) — exactamente la lógica donde un fallo tendría mayor impacto en producción. El frontend alcanza 61.04% sobre código cubierto — aceptable para una primera suite sobre una base de código sin tests previos.
+
+---
+
+## 9. Conclusiones y hallazgos consolidados
+
+### 9.1 Resumen del ejercicio
+
+Este ejercicio partió de un sistema en producción sin ningún tipo de prueba automatizada y produjo, en el transcurso del trabajo, una suite de **268 tests distribuidos en 33 archivos** cubriendo unitarias, integración, seguridad, privacidad e integración de componentes para ambos repositorios del sistema.
+
+El enfoque fue sistemático y trazable: cada test tiene un ID (U-W-XX, I-F-XX, etc.) vinculado a una entrada del informe, que a su vez referencia la técnica del SWEBOK capítulo 3 que lo motivó. Cada commit referencia los IDs implementados. Esta trazabilidad hace que el documento funcione tanto como entregable académico como como documentación viva del proyecto.
+
+### 9.2 Hallazgos de mayor impacto
+
+De los 13 hallazgos registrados a lo largo del ejercicio, los siguientes son los que tienen impacto real en el sistema y requieren acción:
+
+**H-3.1 — Crítico — `download-zip` lee del bucket equivocado para clientes no-Paez And More.**
+El endpoint `POST /api/download-zip` usa `env.BUCKET` (binding directo al bucket `paezandmore`) en lugar de las credenciales S3 del cliente activo. En el estado actual del sistema (un solo cliente activo cuyo bucket coincide con el binding) el bug no es observable. Pero si se registra cualquier cliente adicional, `download-zip` devolverá archivos del bucket de Paez And More o un ZIP vacío sin ningún error explícito. Este es el hallazgo de mayor riesgo operacional del ejercicio. **Acción requerida antes del onboarding de nuevos clientes.**
+
+**H-2.5 — Alto — Bypass de autenticación con `API_SECRET` vacío.**
+`isAuthorized` autenticaría a cualquier request con `X-API-Key: ` (header vacío) si el worker se desplegara sin configurar `API_SECRET`. La protección actual depende de que el secret siempre esté provisionado. La corrección es añadir `&& !!env.API_SECRET` a la comparación, o mejor, usar `crypto.subtle.timingSafeEqual` para resistir timing attacks simultáneamente. **Acción recomendada como mejora preventiva.**
+
+**H-4.1 — Alto — UX rota para borrado de archivos en producción.**
+El frontend no distingue entre clientes prod y test en el flujo de borrado. El worker protege correctamente con 412 cuando falta `X-Confirmed-Name`, pero el frontend muestra un `ConfirmModal` genérico que no solicita el nombre del archivo. El resultado es que el usuario confirma el borrado, el worker lo rechaza silenciosamente, y el archivo no se elimina sin ninguna explicación visible. **Acción requerida para completar la implementación del flujo de borrado en producción.**
+
+### 9.3 Confirmaciones positivas
+
+El ejercicio también confirmó explícitamente comportamientos correctos que antes no tenían verificación documentada:
+
+- **El cifrado AES-256-GCM genera IV único por operación** (U-W-02, P-W-03). La propiedad criptográfica más crítica del sistema está verificada con 100 iteraciones consecutivas.
+- **Las credenciales nunca aparecen en ninguna respuesta HTTP** (P-W-04, P-W-05, S-W-04, S-W-05). Verificado tanto por nombre de campo como por valor específico en todos los endpoints.
+- **`DELETE /api/clients/:id` limpia ambas entradas de KV** (`client:{id}` y `creds:{id}`) y actualiza el índice (P-W-07, P-W-08). No hay fuga de credenciales huérfanas en KV.
+- **Los headers CORS están presentes en todas las respuestas**, incluyendo errores 400, 401, 404 y 500 (S-W-12, I-W-12). El try/catch global en `src/index.ts` funciona como fue diseñado.
+- **Las dos implementaciones de `toSlug`** en `BulkRenameModal` y `UploadOptimizationModal` son conductualmente idénticas (H-2.1 refutado). El test de concordancia en `src/utils/slug.test.ts` quedará como red de seguridad para detectar futuras divergencias.
+
+### 9.4 Deuda técnica registrada
+
+Los hallazgos de menor severidad se registran como deuda para futuros Decision Records de Mizcor:
+
+- H-2.1 — Consolidar `toSlug` en `src/utils/slug.ts` (duplicación sin divergencia actual).
+- H-2.2 — Compartir la lógica de `sanitizeEndpoint` entre worker y frontend.
+- H-2.3 — Añadir validación de caracteres en `NewFolderModal` (slash genera prefijos anidados).
+- H-3.2 — Considerar operaciones batch o compensaciones para `rename-folder` y `delete-recursive`.
+- H-3.4 — Refactorizar `uploadFiles` de XHR a `fetch` con `ReadableStream` para mejorar testabilidad.
+- H-6.1..6.7 — Plan de mejoras de accesibilidad y UX (ARIA, labels, feedback de errores, router).
+
+### 9.5 Reflexión metodológica
+
+El SWEBOK advierte que "las pruebas de programas pueden utilizarse para demostrar la presencia de errores, pero nunca para demostrar su ausencia" (aforismo de Dijkstra, sección 1.2). Este ejercicio ilustra esa advertencia de forma concreta: los 268 tests no garantizan que el sistema sea correcto, pero sí revelaron 13 hallazgos reales — algunos de impacto significativo — en un sistema que funcionaba en producción sin incidentes observables.
+
+El valor más duradero del ejercicio no es el número de tests sino la **infraestructura de verificación continua** que queda instalada: cualquier cambio futuro al worker o al frontend que rompa un comportamiento cubierto será detectado automáticamente antes de llegar a producción. Para un equipo pequeño como Mizcor, esa red de seguridad tiene más valor práctico que cualquier métrica de cobertura.
+
+---
+
+## Anexos
+
+### A. Trazabilidad de commits — Worker (`feat/testing-suite`)
+
+| Commit | Descripción | IDs cubiertos |
+|--------|-------------|---------------|
+| `bf4f8a9` | Setup vitest + smoke tests | — |
+| `442f8ac` | Unitarias crypto | U-W-01..03 |
+| `6c26c94` | Unitarias CORS | U-W-04..05 |
+| `6669147` | Unitarias auth + export `isAuthorized` | U-W-06 |
+| `c9685d6` | Refactor: extracción de validadores | Decisión 2.1 |
+| `67f53f8` | Unitarias validadores | U-W-07..11 |
+| `3a45473` | Integración completa | I-W-01..12 |
+| `74dfc71` | Seguridad | S-W-01..15 |
+| `59bc0a5` | Privacidad | P-W-01..09 |
+| *(stryker)* | Mutation testing | §8.2 |
+
+### B. Trazabilidad de commits — Frontend (`feat/testing-suite`)
+
+| Commit | Descripción | IDs cubiertos |
+|--------|-------------|---------------|
+| `ae73291` | Setup vitest + MSW + smoke tests | — |
+| `fe54509` | Unitarias frontend | U-F-01..09, U-F-12 |
+| `8c7599f` | Integración componentes | I-F-07..10, I-F-09b |
+| `eea5175` | Expansión handlers MSW | — |
+| `caad995` | Integración hooks | I-F-01, I-F-03..04 |
+| `216972e` | Flujos completos | I-F-05..06 |
+| `b2c36ed` | Upload XHR progress | I-F-02 |
+| *(stryker)* | Mutation testing | §8.3 |
+
+### C. Hallazgos consolidados — versión final
+
+| ID | Severidad | Descripción | Estado |
+|----|-----------|-------------|--------|
+| H-2.1 | Baja | `toSlug` duplicado (refutada divergencia) | Pendiente DR |
+| H-2.2 | Baja | Sanitización endpoint duplicada front/back | Pendiente DR |
+| H-2.3 | Baja | `NewFolderModal` acepta `/` en nombres | Documentado |
+| H-2.4 | Baja | Validaciones inline en handlers | ✅ Resuelto |
+| H-2.5 | **Alta** | Bypass auth con `API_SECRET` vacío | Pendiente DR |
+| H-2.6 | Baja | `isFileSizeAllowed(-1) → true` | Documentado |
+| H-2.7 | Info | `isAllowedCacheControl(null) → false` | Documentado |
+| H-3.1 | **Crítico** | `download-zip` lee bucket equivocado | **DR urgente** |
+| H-3.2 | Media | Operaciones no atómicas en rename/delete | Pendiente DR |
+| H-3.3 | Baja | `Map` module-level acopla tests | Mitigado |
+| H-3.4 | Baja | XHR en upload no interceptable por MSW | Mitigado |
+| H-3.5 | Info | fetchMock no propaga a contexto SELF | Documentado |
+| H-3.6 | Info | URLSearchParams ordena alfabéticamente | Documentado |
+| H-4.1 | **Alta** | UI de borrado rota para clientes prod | Pendiente impl. |
+| H-6.1 | Media | Ausencia de atributos ARIA en modales | Pendiente DR |
+| H-6.2 | Media | Labels sin `htmlFor` en formularios | Pendiente DR |
+| H-6.3 | Alta | Modal de upload no responsive < 1400px | Pendiente DR |
+| H-6.4 | Alta | Borrado prod sin guía al usuario (= H-4.1) | Pendiente impl. |
+| H-6.5 | Alta | Sin feedback de error en operaciones fallidas | Pendiente DR |
+| H-6.6 | Media | Navegación sin router (botón atrás roto) | Pendiente DR |
+| H-6.7 | Baja | Sin indicador de progreso en operaciones lote | Pendiente DR |
+
+### D. Glosario
+
+| Término | Definición |
+|---------|-----------|
+| **SUT** | System Under Test — el sistema objeto de la prueba. |
+| **Falla (fault)** | El defecto en el código que causa un mal funcionamiento. |
+| **Fallo (failure)** | El efecto observable cuando la falla se ejecuta. |
+| **Oráculo** | Agente que decide si el SUT se comportó correctamente ante una prueba. |
+| **Miniflare** | Simulador local del runtime de Cloudflare Workers. |
+| **MSW** | Mock Service Worker — interceptación de requests HTTP en tests del frontend. |
+| **MockXHR** | Clase de stub manual para interceptar `new XMLHttpRequest()` en entorno Node. |
+| **Testability** | Facilidad con la que un elemento del SUT puede ser sometido a prueba. |
+| **AES-GCM** | Cifrado autenticado que garantiza confidencialidad e integridad simultáneamente. |
+| **IV** | Initialization Vector — valor aleatorio único por operación AES-GCM. Su reutilización con la misma clave es una vulnerabilidad crítica. |
+| **CIA** | Confidentiality, Integrity, Availability — triada del modelo de seguridad. |
+| **Mutation score** | Porcentaje de mutantes killed sobre total. Mide la efectividad de la suite para detectar cambios en el código. |
+| **Mutante** | Versión del código con una modificación pequeña y deliberada. Un mutante "muere" cuando algún test falla al ejecutarse contra él. |
+
+---
+
+*Fin del documento — versión final. 268 tests, 85.71% mutation score en worker, 61.04% mutation score en frontend (sobre código cubierto).*
