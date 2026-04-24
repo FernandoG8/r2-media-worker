@@ -3,6 +3,7 @@ import { corsHeaders, json, resolveOrigin } from './cors';
 import { createS3Client } from './s3';
 import { listClients, getClient, getClientCredentials, createClient, deleteClient, updateClientConfig } from './clients';
 import { zipSync } from 'fflate';
+import { isAllowedMimeType, isFileSizeAllowed, isAllowedCacheControl, resolveMaxAge, sanitizeEndpoint } from './validators';
 
 export function isAuthorized(request: Request, env: Env): boolean {
   return request.headers.get('X-API-Key') === env.API_SECRET;
@@ -87,10 +88,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
 
     // Sanitize endpoint: remove trailing slash and accidental bucketName suffix
-    const endpoint = body.endpoint
-      .trim()
-      .replace(/\/+$/, '')
-      .replace(new RegExp(`/${body.bucketName}$`), '');
+    const endpoint = sanitizeEndpoint(body.endpoint, body.bucketName);
 
     // Check if already exists
     const existing = await getClient(env.CLIENTS_KV, body.id);
@@ -228,12 +226,11 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
     if (!file) return json({ error: 'No file provided' }, 400, origin);
 
-    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/svg+xml', 'image/avif'];
-    if (!allowedTypes.includes(file.type)) {
+    if (!isAllowedMimeType(file.type)) {
       return json({ error: 'Only image files are allowed' }, 400, origin);
     }
 
-    if (file.size > 10 * 1024 * 1024) {
+    if (!isFileSizeAllowed(file.size)) {
       return json({ error: 'File size exceeds 10MB limit' }, 400, origin);
     }
 
@@ -243,13 +240,8 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     // Optional Cache-Control header forwarded from the upload form.
     // The value is allowlisted to prevent arbitrary header injection.
     const rawCacheControl = formData.get('cache-control') as string | null;
-    const ALLOWED_CACHE_VALUES = new Set([
-      'public, max-age=31536000, immutable',
-      'public, max-age=15768000, immutable',
-      'public, max-age=2592000, immutable',
-    ]);
     const extraHeaders: Record<string, string> = {};
-    if (rawCacheControl && ALLOWED_CACHE_VALUES.has(rawCacheControl)) {
+    if (rawCacheControl && isAllowedCacheControl(rawCacheControl)) {
       extraHeaders['Cache-Control'] = rawCacheControl;
     }
 
@@ -459,10 +451,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     const body = await request.json<{ key: string; maxAge?: number }>();
     if (!body.key) return json({ error: 'Missing key' }, 400, origin);
 
-    const ALLOWED_MAX_AGES = new Set([31536000, 15768000, 2592000]);
-    const maxAge = typeof body.maxAge === 'number' && ALLOWED_MAX_AGES.has(body.maxAge)
-      ? body.maxAge
-      : 31536000;
+    const maxAge = resolveMaxAge(body.maxAge);
 
     await s3.s3UpdateMetadata(client.bucketName, body.key, {
       'Cache-Control': `public, max-age=${maxAge}, immutable`,
