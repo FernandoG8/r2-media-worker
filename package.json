@@ -11,10 +11,13 @@
 		"test:coverage": "vitest run --coverage",
 		"test:unit": "vitest run test/unit",
 		"test:integration": "vitest run test/integration",
-		"cf-typegen": "wrangler types"
+		"cf-typegen": "wrangler types",
+		"test:mutation": "stryker run"
 	},
 	"devDependencies": {
 		"@cloudflare/vitest-pool-workers": "^0.12.4",
+		"@stryker-mutator/core": "^9.6.1",
+		"@stryker-mutator/vitest-runner": "^9.6.1",
 		"@types/node": "^25.3.3",
 		"@vitest/coverage-istanbul": "^3.2.4",
 		"typescript": "^5.5.2",
