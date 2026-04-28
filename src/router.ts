@@ -8,6 +8,43 @@ function isAuthorized(request: Request, env: Env): boolean {
   return request.headers.get('X-API-Key') === env.API_SECRET;
 }
 
+/**
+ * Returns a key that does not collide with existing R2 objects.
+ * If `candidate` exists, tries `stem (1).ext`, `stem (2).ext`, … up to 99.
+ * `excludeKeys` — keys that should be treated as free (e.g. the source files
+ *   being moved this request, which will be deleted after copy).
+ * `usedInBatch` — keys already claimed in the same batch (not yet written to R2).
+ */
+async function resolveUniqueKey(
+  s3Head: (bucket: string, key: string) => Promise<Response>,
+  bucket: string,
+  candidate: string,
+  excludeKeys: Set<string>,
+  usedInBatch: Set<string> = new Set(),
+): Promise<string> {
+  const isFree = async (key: string) => {
+    if (usedInBatch.has(key)) return false;
+    if (excludeKeys.has(key)) return true;
+    const res = await s3Head(bucket, key);
+    return res.status === 404;
+  };
+
+  if (await isFree(candidate)) return candidate;
+
+  const lastSlash = candidate.lastIndexOf('/');
+  const dir = lastSlash >= 0 ? candidate.slice(0, lastSlash + 1) : '';
+  const filename = lastSlash >= 0 ? candidate.slice(lastSlash + 1) : candidate;
+  const dotIdx = filename.lastIndexOf('.');
+  const stem = dotIdx > 0 ? filename.slice(0, dotIdx) : filename;
+  const ext = dotIdx > 0 ? filename.slice(dotIdx) : '';
+
+  for (let i = 1; i < 100; i++) {
+    const next = `${dir}${stem} (${i})${ext}`;
+    if (await isFree(next)) return next;
+  }
+  throw new Error(`Cannot find unique key for ${candidate} after 99 attempts`);
+}
+
 export async function handleRequest(request: Request, env: Env): Promise<Response> {
   const origin = resolveOrigin(request, env);
   const url = new URL(request.url);
@@ -326,11 +363,12 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     const { sourceKey, destKey } = await request.json<{ sourceKey: string; destKey: string }>();
     if (!sourceKey || !destKey) return json({ error: 'Missing sourceKey or destKey' }, 400, origin);
 
-    await s3.s3Copy(client.bucketName, sourceKey, destKey);
+    const resolvedKey = await resolveUniqueKey(s3.s3Head, client.bucketName, destKey, new Set([sourceKey]));
+    await s3.s3Copy(client.bucketName, sourceKey, resolvedKey);
     await s3.s3Delete(client.bucketName, sourceKey);
 
-    const newUrl = `${url.origin}/file/${encodeURIComponent(clientId)}/${destKey.split('/').map(encodeURIComponent).join('/')}`;
-    return json({ ok: true, newKey: destKey, url: newUrl }, 200, origin);
+    const newUrl = `${url.origin}/file/${encodeURIComponent(clientId)}/${resolvedKey.split('/').map(encodeURIComponent).join('/')}`;
+    return json({ ok: true, newKey: resolvedKey, url: newUrl }, 200, origin);
   }
 
   // ── POST /api/bulk-rename — mover/renombrar varios archivos en una sola request ──
@@ -338,13 +376,19 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     const { items } = await request.json<{ items: Array<{ sourceKey: string; destKey: string }> }>();
     if (!items?.length) return json({ error: 'Missing items' }, 400, origin);
 
+    // usedInBatch tracks keys already claimed this request so two files
+    // moving to the same name don't both resolve to the same candidate.
+    const sourceKeys = new Set(items.map(i => i.sourceKey));
+    const usedInBatch = new Set<string>();
     const results: { newKey: string; url: string }[] = [];
     for (const { sourceKey, destKey } of items) {
       if (!sourceKey || !destKey || sourceKey === destKey) continue;
-      await s3.s3Copy(client.bucketName, sourceKey, destKey);
+      const resolvedKey = await resolveUniqueKey(s3.s3Head, client.bucketName, destKey, sourceKeys, usedInBatch);
+      usedInBatch.add(resolvedKey);
+      await s3.s3Copy(client.bucketName, sourceKey, resolvedKey);
       await s3.s3Delete(client.bucketName, sourceKey);
-      const newUrl = `${url.origin}/file/${encodeURIComponent(clientId)}/${destKey.split('/').map(encodeURIComponent).join('/')}`;
-      results.push({ newKey: destKey, url: newUrl });
+      const newUrl = `${url.origin}/file/${encodeURIComponent(clientId)}/${resolvedKey.split('/').map(encodeURIComponent).join('/')}`;
+      results.push({ newKey: resolvedKey, url: newUrl });
     }
     return json({ ok: true, results }, 200, origin);
   }
