@@ -164,7 +164,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   const clientId = request.headers.get('X-Client-ID');
   if (!clientId) {
     // Only require X-Client-ID for media endpoints below
-    const mediaEndpoints = ['/api/list', '/api/upload', '/api/folder', '/api/delete', '/api/folders', '/api/rename', '/api/delete-recursive', '/api/rename-folder', '/api/download-zip', '/api/update-cache-header'];
+    const mediaEndpoints = ['/api/list', '/api/upload', '/api/folder', '/api/delete', '/api/folders', '/api/rename', '/api/bulk-rename', '/api/delete-recursive', '/api/rename-folder', '/api/download-zip', '/api/update-cache-header'];
     if (mediaEndpoints.includes(url.pathname)) {
       return json({ error: 'Missing X-Client-ID header' }, 400, origin);
     }
@@ -331,6 +331,22 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
     const newUrl = `${url.origin}/file/${encodeURIComponent(clientId)}/${destKey.split('/').map(encodeURIComponent).join('/')}`;
     return json({ ok: true, newKey: destKey, url: newUrl }, 200, origin);
+  }
+
+  // ── POST /api/bulk-rename — mover/renombrar varios archivos en una sola request ──
+  if (method === 'POST' && url.pathname === '/api/bulk-rename') {
+    const { items } = await request.json<{ items: Array<{ sourceKey: string; destKey: string }> }>();
+    if (!items?.length) return json({ error: 'Missing items' }, 400, origin);
+
+    const results: { newKey: string; url: string }[] = [];
+    for (const { sourceKey, destKey } of items) {
+      if (!sourceKey || !destKey || sourceKey === destKey) continue;
+      await s3.s3Copy(client.bucketName, sourceKey, destKey);
+      await s3.s3Delete(client.bucketName, sourceKey);
+      const newUrl = `${url.origin}/file/${encodeURIComponent(clientId)}/${destKey.split('/').map(encodeURIComponent).join('/')}`;
+      results.push({ newKey: destKey, url: newUrl });
+    }
+    return json({ ok: true, results }, 200, origin);
   }
 
   // ── POST /api/delete-recursive — eliminar carpeta y contenido ──────────
