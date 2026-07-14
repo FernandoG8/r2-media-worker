@@ -2,6 +2,7 @@ import type { Env } from './types';
 
 const ALLOWED_ORIGINS = [
   'https://panel.mizcor.dev',
+  'https://panel-v2.mizcor.dev',
   'http://localhost:5173',
 ];
 
@@ -9,7 +10,8 @@ export function resolveOrigin(request: Request, env: Env): string {
   const reqOrigin = request.headers.get('Origin') ?? '';
   // Check against allowed list; fall back to env config or wildcard
   if (ALLOWED_ORIGINS.includes(reqOrigin)) return reqOrigin;
-  if (env.ALLOWED_ORIGIN && reqOrigin === env.ALLOWED_ORIGIN) return reqOrigin;
+  const configuredOrigin = env.ALLOWED_ORIGIN?.replace(/\/$/, '');
+  if (configuredOrigin && reqOrigin === configuredOrigin) return reqOrigin;
   return ALLOWED_ORIGINS[0];
 }
 

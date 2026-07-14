@@ -21,6 +21,6 @@
     }
   ],
   "vars": {
-    "ALLOWED_ORIGIN": "https://panel.mizcor.dev"
+    "ALLOWED_ORIGIN": "https://panel-v2.mizcor.dev"
   }
 }
