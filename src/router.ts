@@ -265,8 +265,37 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
     if (!file) return json({ error: 'No file provided' }, 400, origin);
 
-    const allowedTypes = ['image/jpeg', 'image/png', 'image/webp', 'image/gif', 'image/svg+xml', 'image/avif'];
-    if (!allowedTypes.includes(file.type)) {
+    const allowedTypes = [
+      'image/jpeg',
+      'image/png',
+      'image/webp',
+      'image/gif',
+      'image/svg+xml',
+      'image/avif',
+      'image/heic',
+      'image/heif',
+      'image/heic-sequence',
+      'image/bmp',
+      'image/tiff',
+    ];
+
+    // Defensivo: algunos browsers (Windows/Linux) reportan file.type === ''
+    // para .heic/.heif/.bmp/.tiff. Si viene vacío, inferimos el MIME por extensión.
+    let effectiveType = file.type;
+    if (!effectiveType) {
+      const lowerName = file.name.toLowerCase();
+      if (lowerName.endsWith('.heic')) {
+        effectiveType = 'image/heic';
+      } else if (lowerName.endsWith('.heif')) {
+        effectiveType = 'image/heif';
+      } else if (lowerName.endsWith('.bmp')) {
+        effectiveType = 'image/bmp';
+      } else if (lowerName.endsWith('.tif') || lowerName.endsWith('.tiff')) {
+        effectiveType = 'image/tiff';
+      }
+    }
+
+    if (!allowedTypes.includes(effectiveType)) {
       return json({ error: 'Only image files are allowed' }, 400, origin);
     }
 
@@ -290,7 +319,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       extraHeaders['Cache-Control'] = rawCacheControl;
     }
 
-    await s3.s3Put(client.bucketName, key, buffer, file.type || 'application/octet-stream', extraHeaders);
+    await s3.s3Put(client.bucketName, key, buffer, effectiveType || 'application/octet-stream', extraHeaders);
 
     return json(
       {

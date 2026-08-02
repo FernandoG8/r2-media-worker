@@ -4,6 +4,7 @@ const ALLOWED_ORIGINS = [
   'https://panel.mizcor.dev',
   'https://panel-v2.mizcor.dev',
   'http://localhost:5173',
+  'http://localhost:5180',
 ];
 
 export function resolveOrigin(request: Request, env: Env): string {
