@@ -1,5 +1,5 @@
 import type { Env } from './types';
-import { corsHeaders, json, resolveOrigin } from './cors';
+import { ALLOWED_ORIGINS, corsHeaders, json, resolveOrigin } from './cors';
 import { createS3Client } from './s3';
 import { listClients, getClient, getClientCredentials, createClient, deleteClient, updateClientConfig } from './clients';
 
@@ -179,7 +179,19 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       env.MASTER_KEY,
     );
 
-    return json({ id: body.id, name: body.name }, 201, origin);
+    // Best-effort: the presigned backup URLs only work from the browser once
+    // the bucket itself allows the panel's origins via CORS. A failure here
+    // does not block client creation — /api/clients/:id/cors can retry it.
+    let corsWarning: string | undefined;
+    try {
+      const newClientS3 = createS3Client({ accessKeyId: body.accessKeyId, secretAccessKey: body.secretAccessKey }, endpoint);
+      await newClientS3.s3PutBucketCors(body.bucketName, ALLOWED_ORIGINS);
+    } catch (e) {
+      corsWarning = e instanceof Error ? e.message : 'Could not configure bucket CORS';
+      console.error('CORS setup failed for new client', body.id, corsWarning);
+    }
+
+    return json({ id: body.id, name: body.name, ...(corsWarning ? { corsWarning } : {}) }, 201, origin);
   }
 
   // PATCH /api/clients/:id — update mutable fields (env) without re-entering credentials
@@ -205,6 +217,31 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
     await updateClientConfig(env.CLIENTS_KV, clientId, updates);
     return json({ id: clientId, ...updates }, 200, origin);
+  }
+
+  // POST /api/clients/:id/cors — (re)apply the R2 bucket CORS policy needed
+  // for presigned backup upload/download URLs. Safe to call repeatedly —
+  // PutBucketCors replaces the whole policy, it never accumulates duplicates.
+  if (method === 'POST' && url.pathname.endsWith('/cors') && url.pathname.startsWith('/api/clients/')) {
+    if (!isAuthorized(request, env)) return json({ error: 'Unauthorized' }, 401, origin);
+
+    const clientId = decodeURIComponent(url.pathname.slice('/api/clients/'.length, -'/cors'.length));
+    if (!clientId) return json({ error: 'Missing client ID' }, 400, origin);
+
+    const targetClient = await getClient(env.CLIENTS_KV, clientId);
+    if (!targetClient) return json({ error: 'Client not found' }, 404, origin);
+
+    const targetCreds = await getClientCredentials(env.CLIENTS_KV, clientId, env.MASTER_KEY);
+    if (!targetCreds) return json({ error: 'Client credentials not found' }, 500, origin);
+
+    try {
+      const targetS3 = createS3Client(targetCreds, targetClient.endpoint);
+      await targetS3.s3PutBucketCors(targetClient.bucketName, ALLOWED_ORIGINS);
+    } catch (e) {
+      return json({ error: e instanceof Error ? e.message : 'Could not configure bucket CORS' }, 502, origin);
+    }
+
+    return json({ ok: true, bucketName: targetClient.bucketName, allowedOrigins: ALLOWED_ORIGINS }, 200, origin);
   }
 
   // DELETE /api/clients/:id

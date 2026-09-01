@@ -1,6 +1,6 @@
 import type { Env } from './types';
 
-const ALLOWED_ORIGINS = [
+export const ALLOWED_ORIGINS = [
   'https://panel.mizcor.dev',
   'https://panel-v2.mizcor.dev',
   'http://localhost:5173',
