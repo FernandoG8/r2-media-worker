@@ -20,7 +20,7 @@ export function corsHeaders(origin: string) {
   return {
     'Access-Control-Allow-Origin': origin,
     'Access-Control-Allow-Methods': 'GET, POST, DELETE, PATCH, OPTIONS',
-    'Access-Control-Allow-Headers': 'Content-Type, X-API-Key, X-Client-ID, X-Confirmed-Name',
+    'Access-Control-Allow-Headers': 'Content-Type, X-API-Key, X-Client-ID, X-Confirmed-Name, X-Confirmed-Count',
     'Vary': 'Origin',
   };
 }

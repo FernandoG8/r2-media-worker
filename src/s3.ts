@@ -148,6 +148,24 @@ export function createS3Client(creds: ClientCredentials, endpoint: string) {
     return aws.fetch(`${endpoint}/${bucket}/${encodedKey}`, { method: 'HEAD' });
   }
 
+  async function s3Presign(
+    bucket: string,
+    key: string,
+    method: 'GET' | 'PUT',
+    expiresInSeconds = 900,
+    headers?: Record<string, string>,
+  ): Promise<string> {
+    const encodedKey = key.split('/').map(encodeURIComponent).join('/');
+    const url = new URL(`${endpoint}/${bucket}/${encodedKey}`);
+    url.searchParams.set('X-Amz-Expires', String(expiresInSeconds));
+    const signed = await aws.sign(url, {
+      method,
+      headers,
+      aws: { signQuery: true },
+    });
+    return signed.url;
+  }
+
   /**
    * Copy an object to itself replacing only the metadata.
    * The file content is NOT transferred — only the metadata headers change.
@@ -179,5 +197,5 @@ export function createS3Client(creds: ClientCredentials, endpoint: string) {
     if (!res.ok) throw new Error(`S3 UpdateMetadata failed: ${res.status}`);
   }
 
-  return { s3List, s3Get, s3Put, s3Delete, s3Copy, s3Head, s3UpdateMetadata };
+  return { s3List, s3Get, s3Put, s3Delete, s3Copy, s3Head, s3Presign, s3UpdateMetadata };
 }

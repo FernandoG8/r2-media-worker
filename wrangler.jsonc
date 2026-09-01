@@ -7,12 +7,6 @@
     "enabled": true
   },
   "compatibility_flags": ["nodejs_compat"],
-  "r2_buckets": [
-    {
-      "binding": "BUCKET",
-      "bucket_name": "paezandmore"
-    }
-  ],
   "kv_namespaces": [
     {
       "binding": "CLIENTS_KV",

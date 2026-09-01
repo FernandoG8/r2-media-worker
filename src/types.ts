@@ -1,5 +1,4 @@
 export interface Env {
-  BUCKET: R2Bucket;          // temporal — se elimina tras validar S3
   CLIENTS_KV: KVNamespace;
   ALLOWED_ORIGIN: string;
   API_SECRET: string;

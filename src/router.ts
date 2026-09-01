@@ -2,7 +2,36 @@ import type { Env } from './types';
 import { corsHeaders, json, resolveOrigin } from './cors';
 import { createS3Client } from './s3';
 import { listClients, getClient, getClientCredentials, createClient, deleteClient, updateClientConfig } from './clients';
-import { zipSync } from 'fflate';
+
+const TRASH_PREFIX = '.mediapanel-trash/';
+const BACKUP_PREFIX = '.mediapanel-backups/';
+
+function isInternalKey(key: string): boolean {
+  return key.startsWith(TRASH_PREFIX) || key.startsWith(BACKUP_PREFIX);
+}
+
+function normalizeFolderPrefix(prefix: string): string {
+  return prefix.endsWith('/') ? prefix : `${prefix}/`;
+}
+
+async function listAllObjects(
+  s3List: ReturnType<typeof createS3Client>['s3List'],
+  bucket: string,
+  prefix: string,
+) {
+  const objects: Array<{ key: string; size: number; lastModified: string }> = [];
+  let cursor: string | undefined;
+  do {
+    const result = await s3List(bucket, prefix, '', 1000, cursor);
+    objects.push(...result.objects);
+    cursor = result.nextContinuationToken ?? undefined;
+  } while (cursor);
+  return objects;
+}
+
+function createTrashRoot(): string {
+  return `${TRASH_PREFIX}${crypto.randomUUID()}/`;
+}
 
 function isAuthorized(request: Request, env: Env): boolean {
   return request.headers.get('X-API-Key') === env.API_SECRET;
@@ -75,6 +104,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     if (!clientId || !key) {
       return json({ error: 'Missing clientId or key' }, 400, origin);
     }
+    if (isInternalKey(key)) return json({ error: 'Not found' }, 404, origin);
 
     const client = await getClient(env.CLIENTS_KV, clientId);
     if (!client) return json({ error: 'Client not found' }, 404, origin);
@@ -201,7 +231,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   const clientId = request.headers.get('X-Client-ID');
   if (!clientId) {
     // Only require X-Client-ID for media endpoints below
-    const mediaEndpoints = ['/api/list', '/api/upload', '/api/folder', '/api/delete', '/api/folders', '/api/rename', '/api/bulk-rename', '/api/delete-recursive', '/api/rename-folder', '/api/download-zip', '/api/update-cache-header'];
+    const mediaEndpoints = ['/api/list', '/api/upload', '/api/folder', '/api/delete', '/api/restore', '/api/bulk-delete', '/api/folders', '/api/rename', '/api/bulk-rename', '/api/delete-recursive', '/api/rename-folder', '/api/backups', '/api/backups/upload-url', '/api/backups/download-url', '/api/update-cache-header'];
     if (mediaEndpoints.includes(url.pathname)) {
       return json({ error: 'Missing X-Client-ID header' }, 400, origin);
     }
@@ -224,14 +254,14 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
     const result = await s3.s3List(client.bucketName, prefix, '/', limit, cursor);
 
-    const folders = result.folders.map(p => ({
+    const folders = result.folders.filter(p => !isInternalKey(p)).map(p => ({
       type: 'folder',
       key: p,
       name: p.replace(prefix, '').replace(/\/$/, ''),
     }));
 
     const files = result.objects
-      .filter(o => o.key !== prefix && !o.key.endsWith('/'))
+      .filter(o => o.key !== prefix && !o.key.endsWith('/') && !isInternalKey(o.key))
       .map(o => ({
         type: 'file',
         key: o.key,
@@ -264,6 +294,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     const prefix = (formData.get('prefix') as string | null) ?? '';
 
     if (!file) return json({ error: 'No file provided' }, 400, origin);
+    if (isInternalKey(prefix)) return json({ error: 'Reserved prefix' }, 400, origin);
 
     const allowedTypes = [
       'image/jpeg',
@@ -304,7 +335,32 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
 
     const buffer = await file.arrayBuffer();
-    const key = `${prefix}${file.name}`;
+    const requestedKey = `${prefix}${file.name}`;
+    if (isInternalKey(requestedKey)) return json({ error: 'Reserved key' }, 400, origin);
+
+    const overwrite = formData.get('overwrite') === 'true';
+    let key = requestedKey;
+    let restoreToken: string | undefined;
+    const existing = await s3.s3Head(client.bucketName, requestedKey);
+    if (existing.status !== 404 && !existing.ok) {
+      return json({ error: 'Could not verify upload destination' }, 502, origin);
+    }
+    if (existing.ok) {
+      if (overwrite) {
+        if ((client.env ?? 'prod') !== 'test') {
+          const confirmedName = request.headers.get('X-Confirmed-Name');
+          if (confirmedName !== file.name) {
+            return json({ error: 'Production bucket: replacement requires exact filename confirmation' }, 412, origin);
+          }
+        }
+        // Preserve the content being overwritten so a replace can be undone.
+        const trashRoot = createTrashRoot();
+        await s3.s3Copy(client.bucketName, requestedKey, `${trashRoot}${requestedKey}`);
+        restoreToken = trashRoot.slice(TRASH_PREFIX.length, -1);
+      } else {
+        key = await resolveUniqueKey(s3.s3Head, client.bucketName, requestedKey, new Set());
+      }
+    }
 
     // Optional Cache-Control header forwarded from the upload form.
     // The value is allowlisted to prevent arbitrary header injection.
@@ -324,9 +380,10 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     return json(
       {
         key,
-        name: file.name,
+        name: key.split('/').pop() ?? file.name,
         url: `${url.origin}/file/${encodeURIComponent(clientId)}/${key.split('/').map(encodeURIComponent).join('/')}`,
         size: file.size,
+        ...(restoreToken ? { restoreToken } : {}),
       },
       201,
       origin,
@@ -339,6 +396,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     if (!path) return json({ error: 'No path provided' }, 400, origin);
 
     const key = path.endsWith('/') ? path : `${path}/`;
+    if (isInternalKey(key)) return json({ error: 'Reserved prefix' }, 400, origin);
     await s3.s3Put(client.bucketName, key, new ArrayBuffer(0), 'application/x-directory');
 
     return json({ key, name: key }, 201, origin);
@@ -362,8 +420,95 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       }
     }
 
-    await s3.s3Delete(client.bucketName, decodeURIComponent(key));
-    return json({ deleted: key }, 200, origin);
+    const decodedKey = decodeURIComponent(key);
+    if (isInternalKey(decodedKey)) return json({ error: 'Reserved key' }, 400, origin);
+
+    const source = await s3.s3Head(client.bucketName, decodedKey);
+    if (source.status === 404) return json({ error: 'Object not found' }, 404, origin);
+    if (!source.ok) return json({ error: 'Could not verify source object' }, 502, origin);
+
+    const trashRoot = createTrashRoot();
+    await s3.s3Copy(client.bucketName, decodedKey, `${trashRoot}${decodedKey}`);
+    await s3.s3Delete(client.bucketName, decodedKey);
+    return json({ deleted: decodedKey, restoreToken: trashRoot.slice(TRASH_PREFIX.length, -1) }, 200, origin);
+  }
+
+  // ── POST /api/restore — restaurar un borrado desde la papelera interna ──
+  if (method === 'POST' && url.pathname === '/api/restore') {
+    const { restoreToken, overwriteExisting } = await request.json<{ restoreToken: string; overwriteExisting?: boolean }>();
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(restoreToken ?? '')) {
+      return json({ error: 'Invalid restore token' }, 400, origin);
+    }
+
+    const trashRoot = `${TRASH_PREFIX}${restoreToken}/`;
+    const trashedObjects = await listAllObjects(s3.s3List, client.bucketName, trashRoot);
+    if (trashedObjects.length === 0) return json({ error: 'Deleted item not found' }, 404, origin);
+
+    const restores = trashedObjects.map(object => ({
+      sourceKey: object.key,
+      destKey: object.key.slice(trashRoot.length),
+    }));
+
+    // Never overwrite content created after the delete — unless the caller
+    // explicitly opts in (undoing a Replace, where the destination is expected
+    // to hold the content being undone).
+    if (!overwriteExisting) {
+      for (const { destKey } of restores) {
+        const existing = await s3.s3Head(client.bucketName, destKey);
+        if (existing.status === 200) {
+          return json({ error: `Restore destination already exists: ${destKey}` }, 409, origin);
+        }
+        if (existing.status !== 404) {
+          return json({ error: 'Could not verify restore destination' }, 502, origin);
+        }
+      }
+    }
+
+    // Copy every object first. Originals in the trash are only removed after
+    // the complete restore copy succeeds.
+    for (const { sourceKey, destKey } of restores) {
+      await s3.s3Copy(client.bucketName, sourceKey, destKey);
+    }
+    for (const { sourceKey } of restores) {
+      await s3.s3Delete(client.bucketName, sourceKey);
+    }
+
+    return json({ ok: true, restored: restores.map(item => item.destKey) }, 200, origin);
+  }
+
+  // ── POST /api/bulk-delete — borrado lógico por lote (una sola papelera) ──
+  if (method === 'POST' && url.pathname === '/api/bulk-delete') {
+    const { keys } = await request.json<{ keys: string[] }>();
+    if (!Array.isArray(keys) || keys.length === 0) return json({ error: 'Missing keys' }, 400, origin);
+    if (keys.some(isInternalKey)) return json({ error: 'Reserved key' }, 400, origin);
+
+    // Production buckets require the caller to confirm the exact file count.
+    if ((client.env ?? 'prod') !== 'test') {
+      const confirmedCount = request.headers.get('X-Confirmed-Count');
+      if (confirmedCount !== String(keys.length)) {
+        return json(
+          { error: 'Production bucket: X-Confirmed-Count header must match the number of files' },
+          412,
+          origin,
+        );
+      }
+    }
+
+    for (const key of keys) {
+      const existing = await s3.s3Head(client.bucketName, key);
+      if (existing.status === 404) return json({ error: `Object not found: ${key}` }, 404, origin);
+      if (!existing.ok) return json({ error: 'Could not verify source object' }, 502, origin);
+    }
+
+    const trashRoot = createTrashRoot();
+    for (const key of keys) {
+      await s3.s3Copy(client.bucketName, key, `${trashRoot}${key}`);
+    }
+    for (const key of keys) {
+      await s3.s3Delete(client.bucketName, key);
+    }
+
+    return json({ ok: true, deleted: keys.length, restoreToken: trashRoot.slice(TRASH_PREFIX.length, -1) }, 200, origin);
   }
 
   // ── GET /api/folders — lista recursiva de todas las carpetas ────────────
@@ -377,6 +522,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       do {
         const result = await s3.s3List(client.bucketName, prefix, '/', 1000, cursor);
         for (const folder of result.folders) {
+          if (isInternalKey(folder)) continue;
           allFolders.push(folder);
           queue.push(folder);
         }
@@ -391,6 +537,12 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   if (method === 'POST' && url.pathname === '/api/rename') {
     const { sourceKey, destKey } = await request.json<{ sourceKey: string; destKey: string }>();
     if (!sourceKey || !destKey) return json({ error: 'Missing sourceKey or destKey' }, 400, origin);
+    if (sourceKey === destKey) return json({ error: 'Source and destination must be different' }, 400, origin);
+    if (isInternalKey(sourceKey) || isInternalKey(destKey)) return json({ error: 'Reserved key' }, 400, origin);
+
+    const source = await s3.s3Head(client.bucketName, sourceKey);
+    if (source.status === 404) return json({ error: 'Source object not found' }, 404, origin);
+    if (!source.ok) return json({ error: 'Could not verify source object' }, 502, origin);
 
     const resolvedKey = await resolveUniqueKey(s3.s3Head, client.bucketName, destKey, new Set([sourceKey]));
     await s3.s3Copy(client.bucketName, sourceKey, resolvedKey);
@@ -409,16 +561,27 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     // moving to the same name don't both resolve to the same candidate.
     const sourceKeys = new Set(items.map(i => i.sourceKey));
     const usedInBatch = new Set<string>();
-    const results: { newKey: string; url: string }[] = [];
+    const planned: Array<{ sourceKey: string; newKey: string }> = [];
     for (const { sourceKey, destKey } of items) {
       if (!sourceKey || !destKey || sourceKey === destKey) continue;
-      const resolvedKey = await resolveUniqueKey(s3.s3Head, client.bucketName, destKey, sourceKeys, usedInBatch);
+      if (isInternalKey(sourceKey) || isInternalKey(destKey)) return json({ error: 'Reserved key' }, 400, origin);
+      if (sourceKeys.has(destKey) && destKey !== sourceKey) {
+        return json({ error: `Destination is also a source key: ${destKey}` }, 409, origin);
+      }
+      const resolvedKey = await resolveUniqueKey(s3.s3Head, client.bucketName, destKey, new Set([sourceKey]), usedInBatch);
       usedInBatch.add(resolvedKey);
-      await s3.s3Copy(client.bucketName, sourceKey, resolvedKey);
-      await s3.s3Delete(client.bucketName, sourceKey);
-      const newUrl = `${url.origin}/file/${encodeURIComponent(clientId)}/${resolvedKey.split('/').map(encodeURIComponent).join('/')}`;
-      results.push({ newKey: resolvedKey, url: newUrl });
+      planned.push({ sourceKey, newKey: resolvedKey });
     }
+    for (const { sourceKey, newKey } of planned) {
+      await s3.s3Copy(client.bucketName, sourceKey, newKey);
+    }
+    for (const { sourceKey } of planned) {
+      await s3.s3Delete(client.bucketName, sourceKey);
+    }
+    const results = planned.map(({ newKey }) => ({
+      newKey,
+      url: `${url.origin}/file/${encodeURIComponent(clientId)}/${newKey.split('/').map(encodeURIComponent).join('/')}`,
+    }));
     return json({ ok: true, results }, 200, origin);
   }
 
@@ -426,11 +589,13 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   if (method === 'POST' && url.pathname === '/api/delete-recursive') {
     const { prefix: delPrefix } = await request.json<{ prefix: string }>();
     if (!delPrefix) return json({ error: 'Missing prefix' }, 400, origin);
+    const normalizedDelPrefix = normalizeFolderPrefix(delPrefix);
+    if (isInternalKey(normalizedDelPrefix)) return json({ error: 'Reserved prefix' }, 400, origin);
 
     // Production buckets require the caller to confirm the exact folder name
     if ((client.env ?? 'prod') !== 'test') {
       const confirmedName = request.headers.get('X-Confirmed-Name');
-      const expectedName = delPrefix.replace(/\/$/, '').split('/').pop() ?? '';
+      const expectedName = normalizedDelPrefix.replace(/\/$/, '').split('/').pop() ?? '';
       if (!confirmedName || confirmedName !== expectedName) {
         return json(
           { error: 'Production bucket: X-Confirmed-Name header must match the folder name' },
@@ -440,102 +605,109 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       }
     }
 
-    let deleted = 0;
-    let cursor: string | undefined;
-    do {
-      const result = await s3.s3List(client.bucketName, delPrefix, '', 1000, cursor);
-      for (const obj of result.objects) {
-        await s3.s3Delete(client.bucketName, obj.key);
-        deleted++;
-      }
-      cursor = result.nextContinuationToken ?? undefined;
-    } while (cursor);
+    const objects = await listAllObjects(s3.s3List, client.bucketName, normalizedDelPrefix);
+    if (objects.length === 0) return json({ error: 'Folder not found' }, 404, origin);
 
-    // Delete the folder marker itself
-    try { await s3.s3Delete(client.bucketName, delPrefix); } catch {}
-    return json({ ok: true, deleted }, 200, origin);
+    const trashRoot = createTrashRoot();
+    // Complete all copies before deleting any source object. This keeps a
+    // failed recursive delete recoverable and avoids mutating a paginated list.
+    for (const obj of objects) {
+      await s3.s3Copy(client.bucketName, obj.key, `${trashRoot}${obj.key}`);
+    }
+    for (const obj of objects) {
+      await s3.s3Delete(client.bucketName, obj.key);
+    }
+
+    return json({
+      ok: true,
+      deleted: objects.length,
+      restoreToken: trashRoot.slice(TRASH_PREFIX.length, -1),
+    }, 200, origin);
   }
 
   // ── POST /api/rename-folder — renombrar carpeta (batch copy+delete) ────
   if (method === 'POST' && url.pathname === '/api/rename-folder') {
     const { oldPrefix, newPrefix } = await request.json<{ oldPrefix: string; newPrefix: string }>();
     if (!oldPrefix || !newPrefix) return json({ error: 'Missing oldPrefix or newPrefix' }, 400, origin);
+    const normalizedOldPrefix = normalizeFolderPrefix(oldPrefix);
+    const normalizedNewPrefix = normalizeFolderPrefix(newPrefix);
+    if (normalizedOldPrefix === normalizedNewPrefix) {
+      return json({ error: 'Source and destination folders must be different' }, 400, origin);
+    }
+    if (isInternalKey(normalizedOldPrefix) || isInternalKey(normalizedNewPrefix)) {
+      return json({ error: 'Reserved prefix' }, 400, origin);
+    }
+    if (normalizedNewPrefix.startsWith(normalizedOldPrefix) || normalizedOldPrefix.startsWith(normalizedNewPrefix)) {
+      return json({ error: 'Cannot rename a folder into an overlapping path' }, 400, origin);
+    }
 
-    let moved = 0;
-    let cursor: string | undefined;
-    do {
-      const result = await s3.s3List(client.bucketName, oldPrefix, '', 1000, cursor);
-      for (const obj of result.objects) {
-        const newKey = newPrefix + obj.key.slice(oldPrefix.length);
-        await s3.s3Copy(client.bucketName, obj.key, newKey);
-        await s3.s3Delete(client.bucketName, obj.key);
-        moved++;
-      }
-      cursor = result.nextContinuationToken ?? undefined;
-    } while (cursor);
+    const objects = await listAllObjects(s3.s3List, client.bucketName, normalizedOldPrefix);
+    if (objects.length === 0) return json({ error: 'Source folder not found' }, 404, origin);
 
-    // Create new folder marker, delete old one
-    await s3.s3Put(client.bucketName, newPrefix, new ArrayBuffer(0), 'application/x-directory');
-    try { await s3.s3Delete(client.bucketName, oldPrefix); } catch {}
-    return json({ ok: true, moved }, 200, origin);
+    const moves = objects.map(obj => ({
+      sourceKey: obj.key,
+      destKey: normalizedNewPrefix + obj.key.slice(normalizedOldPrefix.length),
+    }));
+
+    // Folder renames must never overwrite an existing destination.
+    for (const { destKey } of moves) {
+      const existing = await s3.s3Head(client.bucketName, destKey);
+      if (existing.status === 200) return json({ error: `Destination already exists: ${destKey}` }, 409, origin);
+      if (existing.status !== 404) return json({ error: 'Could not verify destination' }, 502, origin);
+    }
+    for (const { sourceKey, destKey } of moves) {
+      await s3.s3Copy(client.bucketName, sourceKey, destKey);
+    }
+    for (const { sourceKey } of moves) {
+      await s3.s3Delete(client.bucketName, sourceKey);
+    }
+
+    return json({ ok: true, moved: moves.length, newPrefix: normalizedNewPrefix }, 200, origin);
   }
 
-  // ── POST /api/download-zip ─────────────────────────────────────────────
-  // Body: { keys?: string[], prefix?: string, name?: string }
-  //   keys   → download these specific R2 keys
-  //   prefix → list all objects under prefix and download all (backup)
-  //   name   → ZIP filename (default: backup.zip)
-  if (method === 'POST' && url.pathname === '/api/download-zip') {
-    const body = await request.json<{ keys?: string[]; prefix?: string; name?: string }>();
-    const zipName = (body.name ?? 'backup').replace(/\.zip$/i, '') + '.zip';
+  // ── Backups — ZIPs privados creados por el navegador ──────────────────
+  if (method === 'GET' && url.pathname === '/api/backups') {
+    const objects = await listAllObjects(s3.s3List, client.bucketName, BACKUP_PREFIX);
+    return json({
+      backups: objects
+        .filter(obj => obj.key.endsWith('.zip'))
+        .sort((a, b) => b.lastModified.localeCompare(a.lastModified))
+        .map(obj => ({
+          key: obj.key,
+          name: obj.key.slice(BACKUP_PREFIX.length),
+          size: obj.size,
+          createdAt: obj.lastModified,
+        })),
+    }, 200, origin);
+  }
 
-    // Resolve the list of keys to include
-    let keys: string[] = [];
-
-    if (Array.isArray(body.keys) && body.keys.length > 0) {
-      keys = body.keys;
-    } else if (typeof body.prefix === 'string') {
-      // List all objects recursively under the given prefix
-      let cursor: string | undefined;
-      do {
-        const result = await s3.s3List(client.bucketName, body.prefix, '', 1000, cursor);
-        for (const obj of result.objects) {
-          if (!obj.key.endsWith('/')) keys.push(obj.key); // skip folder markers
-        }
-        cursor = result.nextContinuationToken ?? undefined;
-      } while (cursor);
-    } else {
-      return json({ error: 'Provide keys[] or prefix' }, 400, origin);
+  if (method === 'POST' && url.pathname === '/api/backups/upload-url') {
+    const body = await request.json<{ size?: number }>();
+    if (!Number.isFinite(body.size) || (body.size ?? 0) <= 0) {
+      return json({ error: 'Invalid backup size' }, 400, origin);
     }
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const key = `${BACKUP_PREFIX}backup-${timestamp}.zip`;
+    const uploadUrl = await s3.s3Presign(
+      client.bucketName,
+      key,
+      'PUT',
+      900,
+      { 'Content-Type': 'application/zip' },
+    );
+    return json({ key, uploadUrl, contentType: 'application/zip' }, 200, origin);
+  }
 
-    if (keys.length === 0) return json({ error: 'No files found' }, 404, origin);
-
-    // Fetch all files from R2, then build the ZIP synchronously.
-    // We use env.BUCKET (R2 binding) instead of the S3 API because:
-    //   - S3 API calls count as subrequests (free plan limit: 50/invocation)
-    //   - R2 binding calls are internal and have no subrequest limit
-    const entries: Record<string, Uint8Array> = {};
-
-    for (const key of keys) {
-      const obj = await env.BUCKET.get(key);
-      if (!obj) continue;
-      const buffer = await obj.arrayBuffer();
-      entries[key] = new Uint8Array(buffer);
+  if (method === 'POST' && url.pathname === '/api/backups/download-url') {
+    const { key } = await request.json<{ key: string }>();
+    if (!key?.startsWith(BACKUP_PREFIX) || !key.endsWith('.zip')) {
+      return json({ error: 'Invalid backup key' }, 400, origin);
     }
-
-    if (Object.keys(entries).length === 0) {
-      return json({ error: 'No files could be fetched from R2' }, 500, origin);
-    }
-
-    // level: 0 = store only — images are already compressed, re-compressing
-    // wastes CPU with no size benefit.
-    const zipped = zipSync(entries, { level: 0 });
-
-    const zipHeaders = new Headers(corsHeaders(origin));
-    zipHeaders.set('content-type', 'application/zip');
-    zipHeaders.set('content-disposition', `attachment; filename="${zipName}"`);
-
-    return new Response(zipped, { status: 200, headers: zipHeaders });
+    const existing = await s3.s3Head(client.bucketName, key);
+    if (existing.status === 404) return json({ error: 'Backup not found' }, 404, origin);
+    if (!existing.ok) return json({ error: 'Could not verify backup' }, 502, origin);
+    const downloadUrl = await s3.s3Presign(client.bucketName, key, 'GET', 900);
+    return json({ downloadUrl }, 200, origin);
   }
 
   // ── POST /api/update-cache-header ──────────────────────────────────────
@@ -547,6 +719,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   if (method === 'POST' && url.pathname === '/api/update-cache-header') {
     const body = await request.json<{ key: string; maxAge?: number }>();
     if (!body.key) return json({ error: 'Missing key' }, 400, origin);
+    if (isInternalKey(body.key)) return json({ error: 'Reserved key' }, 400, origin);
 
     const ALLOWED_MAX_AGES = new Set([31536000, 15768000, 2592000]);
     const maxAge = typeof body.maxAge === 'number' && ALLOWED_MAX_AGES.has(body.maxAge)
