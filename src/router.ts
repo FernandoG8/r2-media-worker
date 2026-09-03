@@ -1,5 +1,6 @@
 import type { Env } from './types';
 import { ALLOWED_ORIGINS, corsHeaders, json, resolveOrigin } from './cors';
+import { verifyAccessJwt } from './access';
 import { createS3Client } from './s3';
 import { listClients, getClient, getClientCredentials, createClient, deleteClient, updateClientConfig } from './clients';
 
@@ -33,8 +34,17 @@ function createTrashRoot(): string {
   return `${TRASH_PREFIX}${crypto.randomUUID()}/`;
 }
 
-function isAuthorized(request: Request, env: Env): boolean {
-  return request.headers.get('X-API-Key') === env.API_SECRET;
+async function isAuthorized(request: Request, env: Env): Promise<boolean> {
+  // Temporary defense in depth while the panel still sends X-API-Key. Hashing
+  // both values avoids leaking its length before Workers' timing-safe compare.
+  const provided = request.headers.get('X-API-Key') ?? '';
+  const expected = env.API_SECRET ?? '';
+  const encoder = new TextEncoder();
+  const [providedHash, expectedHash] = await Promise.all([
+    crypto.subtle.digest('SHA-256', encoder.encode(provided)),
+    crypto.subtle.digest('SHA-256', encoder.encode(expected)),
+  ]);
+  return Boolean(expected) && crypto.subtle.timingSafeEqual(providedHash, expectedHash);
 }
 
 /**
@@ -125,18 +135,28 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     return new Response(res.body, { headers });
   }
 
+  // All API routes require a Cloudflare Access assertion before any client,
+  // credentials, or R2 state is consulted. OPTIONS intentionally returned
+  // above: browser preflights do not carry the Access cookie/assertion.
+  if (url.pathname.startsWith('/api/')) {
+    const access = await verifyAccessJwt(request, env);
+    if (!access.ok) return json({ error: access.error }, access.status, origin);
+  } else {
+    return json({ error: 'Not found' }, 404, origin);
+  }
+
   // ── Client management endpoints (auth required, no X-Client-ID) ───────────
 
   // GET /api/clients
   if (method === 'GET' && url.pathname === '/api/clients') {
-    if (!isAuthorized(request, env)) return json({ error: 'Unauthorized' }, 401, origin);
+    if (!await isAuthorized(request, env)) return json({ error: 'Unauthorized' }, 401, origin);
     const clients = await listClients(env.CLIENTS_KV);
     return json(clients, 200, origin);
   }
 
   // POST /api/clients
   if (method === 'POST' && url.pathname === '/api/clients') {
-    if (!isAuthorized(request, env)) return json({ error: 'Unauthorized' }, 401, origin);
+    if (!await isAuthorized(request, env)) return json({ error: 'Unauthorized' }, 401, origin);
 
     const body = await request.json<{
       id: string;
@@ -196,7 +216,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
   // PATCH /api/clients/:id — update mutable fields (env) without re-entering credentials
   if (method === 'PATCH' && url.pathname.startsWith('/api/clients/')) {
-    if (!isAuthorized(request, env)) return json({ error: 'Unauthorized' }, 401, origin);
+    if (!await isAuthorized(request, env)) return json({ error: 'Unauthorized' }, 401, origin);
 
     const clientId = decodeURIComponent(url.pathname.slice('/api/clients/'.length));
     if (!clientId) return json({ error: 'Missing client ID' }, 400, origin);
@@ -223,7 +243,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   // for presigned backup upload/download URLs. Safe to call repeatedly —
   // PutBucketCors replaces the whole policy, it never accumulates duplicates.
   if (method === 'POST' && url.pathname.endsWith('/cors') && url.pathname.startsWith('/api/clients/')) {
-    if (!isAuthorized(request, env)) return json({ error: 'Unauthorized' }, 401, origin);
+    if (!await isAuthorized(request, env)) return json({ error: 'Unauthorized' }, 401, origin);
 
     const clientId = decodeURIComponent(url.pathname.slice('/api/clients/'.length, -'/cors'.length));
     if (!clientId) return json({ error: 'Missing client ID' }, 400, origin);
@@ -246,7 +266,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
   // DELETE /api/clients/:id
   if (method === 'DELETE' && url.pathname.startsWith('/api/clients/')) {
-    if (!isAuthorized(request, env)) return json({ error: 'Unauthorized' }, 401, origin);
+    if (!await isAuthorized(request, env)) return json({ error: 'Unauthorized' }, 401, origin);
 
     const clientId = decodeURIComponent(url.pathname.slice('/api/clients/'.length));
     if (!clientId) return json({ error: 'Missing client ID' }, 400, origin);
@@ -260,7 +280,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
   // ── Media endpoints (auth + X-Client-ID required) ─────────────────────────
 
-  if (!isAuthorized(request, env)) {
+  if (!await isAuthorized(request, env)) {
     return json({ error: 'Unauthorized' }, 401, origin);
   }
 

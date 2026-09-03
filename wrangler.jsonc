@@ -2,7 +2,9 @@
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "r2-media-worker",
   "main": "src/index.ts",
-  "compatibility_date": "2026-03-03",
+  "compatibility_date": "2026-09-02",
+  // Preserve TEAM_DOMAIN and POLICY_AUD when they are managed in the dashboard.
+  "keep_vars": true,
   "observability": {
     "enabled": true
   },

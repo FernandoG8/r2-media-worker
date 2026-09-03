@@ -19,6 +19,9 @@ export function resolveOrigin(request: Request, env: Env): string {
 export function corsHeaders(origin: string) {
   return {
     'Access-Control-Allow-Origin': origin,
+    // Required when the panel and Worker use different origins: the browser
+    // must send the CF_Authorization cookie so Access can inject the assertion.
+    'Access-Control-Allow-Credentials': 'true',
     'Access-Control-Allow-Methods': 'GET, POST, DELETE, PATCH, OPTIONS',
     'Access-Control-Allow-Headers': 'Content-Type, X-API-Key, X-Client-ID, X-Confirmed-Name, X-Confirmed-Count',
     'Vary': 'Origin',

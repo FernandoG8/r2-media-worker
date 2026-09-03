@@ -3,6 +3,10 @@ export interface Env {
   ALLOWED_ORIGIN: string;
   API_SECRET: string;
   MASTER_KEY: string;        // AES-256 key en base64
+  /** `https://<team>.cloudflareaccess.com`, set outside source control. */
+  TEAM_DOMAIN: string;
+  /** Access Application audience (`aud`) for this Worker API. */
+  POLICY_AUD: string;
 }
 
 export interface ClientConfig {
