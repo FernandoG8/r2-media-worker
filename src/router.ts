@@ -128,9 +128,14 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     if (!res.ok) return json({ error: 'Not found' }, 404, origin);
 
     const headers = new Headers(corsHeaders(origin));
-    const ct = res.headers.get('content-type');
-    if (ct) headers.set('content-type', ct);
-    headers.set('cache-control', 'public, max-age=31536000');
+    // Preserve object HTTP metadata (content type, cache policy, disposition,
+    // encoding, etc.) instead of replacing it with a one-year default.
+    for (const header of ['content-type', 'cache-control', 'content-language', 'content-disposition', 'content-encoding', 'expires', 'etag', 'last-modified']) {
+      const value = res.headers.get(header);
+      if (value) headers.set(header, value);
+    }
+    // Objects uploaded without a cache policy get a conservative public cache.
+    if (!headers.has('cache-control')) headers.set('cache-control', 'public, max-age=3600');
 
     return new Response(res.body, { headers });
   }
