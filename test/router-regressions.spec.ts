@@ -78,4 +78,22 @@ describe('media route regressions', () => {
     expect(fallback.headers.get('cache-control')).toBe('public, max-age=3600');
   });
 
+  it('deletes a literal percent key without decoding it twice', async () => {
+    const response = await handleRequest(new Request(
+      'https://worker.example/api/delete?key=gallery%2F100%2520real.jpg',
+      {
+        method: 'DELETE',
+        headers: {
+          'X-API-Key': 'secret',
+          'X-Client-ID': 'client',
+          'X-Confirmed-Name': '100%20real.jpg',
+        },
+      },
+    ), env);
+
+    expect(response.status).toBe(200);
+    expect(s3Head).toHaveBeenCalledWith('bucket', 'gallery/100%20real.jpg');
+    expect(s3Copy).toHaveBeenCalledWith('bucket', expect.stringContaining('gallery/100%20real.jpg'), expect.any(String));
+    expect(s3Delete).toHaveBeenCalledWith('bucket', 'gallery/100%20real.jpg');
+  });
 });

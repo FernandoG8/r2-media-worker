@@ -472,7 +472,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     // Production buckets require the caller to confirm the exact filename
     if ((client.env ?? 'prod') !== 'test') {
       const confirmedName = request.headers.get('X-Confirmed-Name');
-      const expectedName = decodeURIComponent(key).split('/').pop() ?? '';
+      const expectedName = key.split('/').pop() ?? '';
       if (!confirmedName || confirmedName !== expectedName) {
         return json(
           { error: 'Production bucket: X-Confirmed-Name header must match the filename' },
@@ -482,7 +482,10 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
       }
     }
 
-    const decodedKey = decodeURIComponent(key);
+    // URLSearchParams.get() already percent-decodes the query value. Decode
+    // again here would turn a literal key such as `100%20real.jpg` into a
+    // different object name.
+    const decodedKey = key;
     if (isInternalKey(decodedKey)) return json({ error: 'Reserved key' }, 400, origin);
 
     const source = await s3.s3Head(client.bucketName, decodedKey);
