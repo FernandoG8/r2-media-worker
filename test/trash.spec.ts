@@ -14,21 +14,7 @@ vi.mock('../src/clients', () => ({
   listClients: vi.fn(), createClient: vi.fn(), deleteClient: vi.fn(), updateClientConfig: vi.fn(),
 }));
 vi.mock('../src/s3', () => ({
-  TRASH_PREFIX: '.mediapanel-trash/',
-  createS3Client: vi.fn(() => ({
-    s3List,
-    s3Get,
-    s3Head,
-    s3Copy,
-    s3Delete,
-    s3Put: vi.fn(),
-    s3Presign: vi.fn(),
-    s3PutBucketCors: vi.fn(),
-    s3UpdateMetadata: vi.fn(),
-    s3GetBucketLifecycleConfiguration: vi.fn(),
-    s3PutBucketLifecycleConfiguration: vi.fn(),
-    s3ApplyTrashLifecycleRule: vi.fn(),
-  })),
+  createS3Client: vi.fn(() => ({ s3List, s3Get, s3Head, s3Copy, s3Delete, s3Put: vi.fn(), s3Presign: vi.fn(), s3PutBucketCors: vi.fn(), s3UpdateMetadata: vi.fn() })),
 }));
 
 import { handleRequest } from '../src/router';

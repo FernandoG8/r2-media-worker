@@ -7,15 +7,6 @@ interface S3Object {
   lastModified: string;
 }
 
-// The trash lifecycle rule is identified by this constant ID so it can be
-// found and replaced in-place inside a bucket's existing lifecycle
-// configuration without touching any other rule. The prefix MUST stay
-// scoped to the trash folder — an empty or wrong prefix would expire every
-// object in the bucket.
-export const TRASH_PREFIX = '.mediapanel-trash/';
-export const TRASH_LIFECYCLE_RULE_ID = 'mediapanel-trash-30d';
-export const TRASH_LIFECYCLE_EXPIRATION_DAYS = 30;
-
 interface S3ListResult {
   folders: string[];
   objects: S3Object[];
@@ -47,47 +38,6 @@ function parseAllXmlTags(xml: string, tag: string): string[] {
     pos = end + close.length;
   }
   return results;
-}
-
-/**
- * Same walk as parseAllXmlTags, but returns each full block including its
- * own opening/closing tags, verbatim from the source string. Used to carry
- * rules we do not understand through untouched, instead of reconstructing
- * them field by field.
- */
-function parseAllXmlBlocks(xml: string, tag: string): string[] {
-  const results: string[] = [];
-  const open = `<${tag}>`;
-  const close = `</${tag}>`;
-  let pos = 0;
-  while (true) {
-    const start = xml.indexOf(open, pos);
-    if (start === -1) break;
-    const end = xml.indexOf(close, start);
-    if (end === -1) break;
-    results.push(xml.slice(start, end + close.length));
-    pos = end + close.length;
-  }
-  return results;
-}
-
-/**
- * Extracts every <Rule>...</Rule> block from a lifecycle configuration
- * document verbatim. Refuses (throws) rather than guess if the document
- * contains a rule shape parseAllXmlBlocks cannot round-trip faithfully —
- * for example a <Rule with attributes instead of a plain <Rule> tag. Losing
- * an unrecognized rule silently would mean writing back a mutilated
- * configuration, which is worse than failing the whole operation.
- */
-function extractLifecycleRuleBlocksOrThrow(xml: string): string[] {
-  const blocks = parseAllXmlBlocks(xml, 'Rule');
-  const openTagCount = (xml.match(/<Rule[\s>]/g) ?? []).length;
-  if (openTagCount !== blocks.length) {
-    throw new Error(
-      'S3 lifecycle configuration contains rules this client cannot safely parse; refusing to rewrite it',
-    );
-  }
-  return blocks;
 }
 
 export function createS3Client(creds: ClientCredentials, endpoint: string) {
@@ -249,86 +199,6 @@ export function createS3Client(creds: ClientCredentials, endpoint: string) {
   }
 
   /**
-   * Read the bucket's current lifecycle configuration (S3
-   * GetBucketLifecycleConfiguration) and return each of its rules as a raw
-   * <Rule>...</Rule> XML block, untouched.
-   *
-   * A bucket with no lifecycle configuration at all is a normal, expected
-   * state — R2 answers that with a 404 whose body carries the
-   * NoSuchLifecycleConfiguration error code — and is reported as an empty
-   * rule list rather than an error. Any other failure (including a 404 for
-   * a different reason) is thrown.
-   */
-  async function s3GetBucketLifecycleConfiguration(bucket: string): Promise<string[]> {
-    const res = await aws.fetch(`${endpoint}/${bucket}?lifecycle`);
-    if (res.status === 404) {
-      const detail = await res.text().catch(() => '');
-      if (detail.includes('<Code>NoSuchLifecycleConfiguration</Code>')) {
-        return [];
-      }
-      throw new Error(`S3 GetBucketLifecycleConfiguration failed: 404 ${detail.slice(0, 300)}`);
-    }
-    if (!res.ok) {
-      const detail = await res.text().catch(() => '');
-      throw new Error(`S3 GetBucketLifecycleConfiguration failed: ${res.status} ${detail.slice(0, 300)}`);
-    }
-    const xml = await res.text();
-    return extractLifecycleRuleBlocksOrThrow(xml);
-  }
-
-  /**
-   * Write the bucket's lifecycle configuration (S3
-   * PutBucketLifecycleConfiguration). This REPLACES the entire
-   * configuration — callers must pass every rule that should survive, not
-   * just the one they care about.
-   */
-  async function s3PutBucketLifecycleConfiguration(bucket: string, ruleBlocks: string[]): Promise<void> {
-    const body = `<?xml version="1.0" encoding="UTF-8"?>` +
-      `<LifecycleConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">` +
-      ruleBlocks.join('') +
-      `</LifecycleConfiguration>`;
-
-    const res = await aws.fetch(`${endpoint}/${bucket}?lifecycle`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/xml' },
-      body,
-    });
-    if (!res.ok) {
-      const detail = await res.text().catch(() => '');
-      throw new Error(`S3 PutBucketLifecycleConfiguration failed: ${res.status} ${detail.slice(0, 300)}`);
-    }
-  }
-
-  function buildTrashLifecycleRuleBlock(): string {
-    return `<Rule>` +
-      `<ID>${xmlEscape(TRASH_LIFECYCLE_RULE_ID)}</ID>` +
-      `<Filter><Prefix>${xmlEscape(TRASH_PREFIX)}</Prefix></Filter>` +
-      `<Status>Enabled</Status>` +
-      `<Expiration><Days>${TRASH_LIFECYCLE_EXPIRATION_DAYS}</Days></Expiration>` +
-      `</Rule>`;
-  }
-
-  /**
-   * Ensure the bucket expires trash objects after
-   * TRASH_LIFECYCLE_EXPIRATION_DAYS days, without disturbing any other
-   * lifecycle rule already configured on the bucket (such as R2's default
-   * multipart-abort rule, or a client-specific rule we don't know about).
-   *
-   * Reads the existing configuration, drops only the rule matching our own
-   * ID (so re-applying is idempotent instead of accumulating duplicates),
-   * keeps every other rule byte-for-byte, appends a freshly built copy of
-   * our rule, and writes the merged set back.
-   */
-  async function s3ApplyTrashLifecycleRule(bucket: string): Promise<void> {
-    const existingRuleBlocks = await s3GetBucketLifecycleConfiguration(bucket);
-    const otherRuleBlocks = existingRuleBlocks.filter(
-      block => parseXmlTag(block, 'ID') !== TRASH_LIFECYCLE_RULE_ID,
-    );
-    const nextRuleBlocks = [...otherRuleBlocks, buildTrashLifecycleRuleBlock()];
-    await s3PutBucketLifecycleConfiguration(bucket, nextRuleBlocks);
-  }
-
-  /**
    * Copy an object to itself replacing only the metadata.
    * The file content is NOT transferred — only the metadata headers change.
    * Used to update Cache-Control on existing objects without re-uploading.
@@ -359,18 +229,5 @@ export function createS3Client(creds: ClientCredentials, endpoint: string) {
     if (!res.ok) throw new Error(`S3 UpdateMetadata failed: ${res.status}`);
   }
 
-  return {
-    s3List,
-    s3Get,
-    s3Put,
-    s3Delete,
-    s3Copy,
-    s3Head,
-    s3Presign,
-    s3PutBucketCors,
-    s3UpdateMetadata,
-    s3GetBucketLifecycleConfiguration,
-    s3PutBucketLifecycleConfiguration,
-    s3ApplyTrashLifecycleRule,
-  };
+  return { s3List, s3Get, s3Put, s3Delete, s3Copy, s3Head, s3Presign, s3PutBucketCors, s3UpdateMetadata };
 }

@@ -1,9 +1,10 @@
 import type { Env } from './types';
 import { ALLOWED_ORIGINS, corsHeaders, json, resolveOrigin } from './cors';
 import { verifyAccessJwt } from './access';
-import { createS3Client, TRASH_PREFIX } from './s3';
+import { createS3Client } from './s3';
 import { listClients, getClient, getClientCredentials, createClient, deleteClient, updateClientConfig } from './clients';
 
+const TRASH_PREFIX = '.mediapanel-trash/';
 const BACKUP_PREFIX = '.mediapanel-backups/';
 
 function isInternalKey(key: string): boolean {
@@ -249,36 +250,15 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     // the bucket itself allows the panel's origins via CORS. A failure here
     // does not block client creation — /api/clients/:id/cors can retry it.
     let corsWarning: string | undefined;
-    let lifecycleWarning: string | undefined;
-    const newClientS3 = createS3Client({ accessKeyId: body.accessKeyId, secretAccessKey: body.secretAccessKey }, endpoint);
     try {
+      const newClientS3 = createS3Client({ accessKeyId: body.accessKeyId, secretAccessKey: body.secretAccessKey }, endpoint);
       await newClientS3.s3PutBucketCors(body.bucketName, ALLOWED_ORIGINS);
     } catch (e) {
       corsWarning = e instanceof Error ? e.message : 'Could not configure bucket CORS';
       console.error('CORS setup failed for new client', body.id, corsWarning);
     }
 
-    // Best-effort, same reasoning as CORS above: without this rule a new
-    // client's trash keeps growing forever unnoticed. A failure here does
-    // not block client creation — /api/clients/:id/trash-lifecycle can
-    // retry it.
-    try {
-      await newClientS3.s3ApplyTrashLifecycleRule(body.bucketName);
-    } catch (e) {
-      lifecycleWarning = e instanceof Error ? e.message : 'Could not configure trash lifecycle rule';
-      console.error('Trash lifecycle setup failed for new client', body.id, lifecycleWarning);
-    }
-
-    return json(
-      {
-        id: body.id,
-        name: body.name,
-        ...(corsWarning ? { corsWarning } : {}),
-        ...(lifecycleWarning ? { lifecycleWarning } : {}),
-      },
-      201,
-      origin,
-    );
+    return json({ id: body.id, name: body.name, ...(corsWarning ? { corsWarning } : {}) }, 201, origin);
   }
 
   // PATCH /api/clients/:id — update mutable fields (env) without re-entering credentials
@@ -329,32 +309,6 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     }
 
     return json({ ok: true, bucketName: targetClient.bucketName, allowedOrigins: ALLOWED_ORIGINS }, 200, origin);
-  }
-
-  // POST /api/clients/:id/trash-lifecycle — (re)apply the R2 bucket lifecycle
-  // rule that expires .mediapanel-trash/ objects after 30 days. Safe to call
-  // repeatedly: existing rules other than our own are preserved untouched,
-  // and our own rule is replaced in place rather than duplicated.
-  if (method === 'POST' && url.pathname.endsWith('/trash-lifecycle') && url.pathname.startsWith('/api/clients/')) {
-    if (!await isAuthorized(request, env)) return json({ error: 'Unauthorized' }, 401, origin);
-
-    const clientId = decodeURIComponent(url.pathname.slice('/api/clients/'.length, -'/trash-lifecycle'.length));
-    if (!clientId) return json({ error: 'Missing client ID' }, 400, origin);
-
-    const targetClient = await getClient(env.CLIENTS_KV, clientId);
-    if (!targetClient) return json({ error: 'Client not found' }, 404, origin);
-
-    const targetCreds = await getClientCredentials(env.CLIENTS_KV, clientId, env.MASTER_KEY);
-    if (!targetCreds) return json({ error: 'Client credentials not found' }, 500, origin);
-
-    try {
-      const targetS3 = createS3Client(targetCreds, targetClient.endpoint);
-      await targetS3.s3ApplyTrashLifecycleRule(targetClient.bucketName);
-    } catch (e) {
-      return json({ error: e instanceof Error ? e.message : 'Could not configure trash lifecycle rule' }, 502, origin);
-    }
-
-    return json({ ok: true, bucketName: targetClient.bucketName }, 200, origin);
   }
 
   // DELETE /api/clients/:id
