@@ -15,6 +15,29 @@ function normalizeFolderPrefix(prefix: string): string {
   return prefix.endsWith('/') ? prefix : `${prefix}/`;
 }
 
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+
+function parseTrashLimit(value: string | null, fallback: number, maximum: number): number | null {
+  if (value === null) return fallback;
+  if (!/^\d+$/.test(value)) return null;
+  const parsed = Number(value);
+  return Number.isSafeInteger(parsed) && parsed >= 1 && parsed <= maximum ? parsed : null;
+}
+
+function parseTrashCursor(value: string | null): string | undefined | null {
+  if (value === null || value === '') return undefined;
+  // Cursors are provider-issued opaque values. Only transport size is checked;
+  // URLSearchParams has already decoded the query component for us.
+  return value.length <= 4096 ? value : null;
+}
+
+function isTrashGroupPrefix(prefix: string): boolean {
+  return prefix.startsWith(TRASH_PREFIX) &&
+    prefix.endsWith('/') &&
+    UUID_V4.test(prefix.slice(TRASH_PREFIX.length, -1)) &&
+    prefix.slice(TRASH_PREFIX.length, -1).indexOf('/') === -1;
+}
+
 async function listAllObjects(
   s3List: ReturnType<typeof createS3Client>['s3List'],
   bucket: string,
@@ -294,7 +317,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   if (!clientId) {
     // Only require X-Client-ID for media endpoints below
     const mediaEndpoints = ['/api/list', '/api/upload', '/api/folder', '/api/delete', '/api/restore', '/api/bulk-delete', '/api/folders', '/api/rename', '/api/bulk-rename', '/api/delete-recursive', '/api/rename-folder', '/api/backups', '/api/backups/upload-url', '/api/backups/download-url', '/api/update-cache-header'];
-    if (mediaEndpoints.includes(url.pathname)) {
+    if (mediaEndpoints.includes(url.pathname) || /^\/api\/trash(?:\/[^/]+)?$/.test(url.pathname)) {
       return json({ error: 'Missing X-Client-ID header' }, 400, origin);
     }
     return json({ error: 'Not found' }, 404, origin);
@@ -307,6 +330,68 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   if (!creds) return json({ error: 'Client credentials not found' }, 500, origin);
 
   const s3 = createS3Client(creds, client.endpoint);
+
+  // ── GET /api/trash[/:token] — consulta de papelera, sin mutaciones ───────
+  const trashPath = /^\/api\/trash(?:\/([^/]+))?$/.exec(url.pathname);
+  if (method === 'GET' && trashPath) {
+    const limit = trashPath[1]
+      ? parseTrashLimit(url.searchParams.get('limit'), 100, 1000)
+      : parseTrashLimit(url.searchParams.get('limit'), 20, 100);
+    if (limit === null) return json({ error: 'Invalid limit' }, 400, origin);
+
+    const cursor = parseTrashCursor(url.searchParams.get('cursor'));
+    if (cursor === null) return json({ error: 'Invalid cursor' }, 400, origin);
+
+    if (!trashPath[1]) {
+      try {
+        const result = await s3.s3List(client.bucketName, TRASH_PREFIX, '/', limit, cursor);
+        if (result.isTruncated && !result.nextContinuationToken) {
+          return json({ error: 'Storage returned a truncated page without a cursor' }, 502, origin);
+        }
+        const groups = result.folders
+          .filter(isTrashGroupPrefix)
+          .map(prefix => ({
+            restoreToken: prefix.slice(TRASH_PREFIX.length, -1),
+            count: null,
+          }));
+        return json({ groups, nextCursor: result.nextContinuationToken ?? null }, 200, origin);
+      } catch {
+        // Provider errors are intentionally opaque. Without a typed provider
+        // error code, a 400 may be a malformed request unrelated to cursor.
+        return json({ error: 'Could not list trash' }, 502, origin);
+      }
+    }
+
+    let token: string;
+    try {
+      token = decodeURIComponent(trashPath[1]);
+    } catch {
+      return json({ error: 'Invalid restore token' }, 400, origin);
+    }
+    if (!UUID_V4.test(token)) return json({ error: 'Invalid restore token' }, 400, origin);
+
+    const trashRoot = `${TRASH_PREFIX}${token}/`;
+    try {
+      const result = await s3.s3List(client.bucketName, trashRoot, '', limit, cursor);
+      if (result.isTruncated && !result.nextContinuationToken) {
+        return json({ error: 'Storage returned a truncated page without a cursor' }, 502, origin);
+      }
+      // A valid group is represented by at least one object. Every returned key
+      // must remain inside the requested group before its internal prefix is removed.
+      if (result.objects.length === 0) return json({ error: 'Trash group not found' }, 404, origin);
+      const items = result.objects
+        .filter(object => object.key.startsWith(trashRoot) && object.key.length > trashRoot.length)
+        .map(object => ({
+          key: object.key.slice(trashRoot.length),
+          size: object.size,
+          uploaded: object.lastModified || null,
+        }));
+      if (items.length === 0) return json({ error: 'Trash group not found' }, 404, origin);
+      return json({ items, nextCursor: result.nextContinuationToken ?? null }, 200, origin);
+    } catch {
+      return json({ error: 'Could not list trash group' }, 502, origin);
+    }
+  }
 
   // ── GET /api/list?prefix=&limit=50&cursor= ────────────────────────────────
   if (method === 'GET' && url.pathname === '/api/list') {
