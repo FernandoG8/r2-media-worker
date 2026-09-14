@@ -22,6 +22,7 @@ vi.mock('../src/clients', () => ({
   updateClientConfig: vi.fn(),
 }));
 vi.mock('../src/s3', () => ({
+  TRASH_PREFIX: '.mediapanel-trash/',
   createS3Client: vi.fn(() => ({
     s3Head,
     s3Copy,
@@ -32,6 +33,9 @@ vi.mock('../src/s3', () => ({
     s3Presign: vi.fn(),
     s3PutBucketCors: vi.fn(),
     s3UpdateMetadata: vi.fn(),
+    s3GetBucketLifecycleConfiguration: vi.fn(),
+    s3PutBucketLifecycleConfiguration: vi.fn(),
+    s3ApplyTrashLifecycleRule: vi.fn(),
   })),
 }));
 
