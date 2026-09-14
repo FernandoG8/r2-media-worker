@@ -1,7 +1,8 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
-const { s3List, getClient, getClientCredentials } = vi.hoisted(() => ({
-  s3List: vi.fn(), getClient: vi.fn(), getClientCredentials: vi.fn(),
+const { s3List, s3Get, s3Head, s3Copy, s3Delete, getClient, getClientCredentials } = vi.hoisted(() => ({
+  s3List: vi.fn(), s3Get: vi.fn(), s3Head: vi.fn(), s3Copy: vi.fn(), s3Delete: vi.fn(),
+  getClient: vi.fn(), getClientCredentials: vi.fn(),
 }));
 
 vi.mock('../src/access', () => ({
@@ -13,7 +14,7 @@ vi.mock('../src/clients', () => ({
   listClients: vi.fn(), createClient: vi.fn(), deleteClient: vi.fn(), updateClientConfig: vi.fn(),
 }));
 vi.mock('../src/s3', () => ({
-  createS3Client: vi.fn(() => ({ s3List, s3Get: vi.fn(), s3Head: vi.fn(), s3Copy: vi.fn(), s3Delete: vi.fn(), s3Put: vi.fn(), s3Presign: vi.fn(), s3PutBucketCors: vi.fn(), s3UpdateMetadata: vi.fn() })),
+  createS3Client: vi.fn(() => ({ s3List, s3Get, s3Head, s3Copy, s3Delete, s3Put: vi.fn(), s3Presign: vi.fn(), s3PutBucketCors: vi.fn(), s3UpdateMetadata: vi.fn() })),
 }));
 
 import { handleRequest } from '../src/router';
@@ -29,6 +30,10 @@ beforeEach(() => {
   getClient.mockResolvedValue({ bucketName: 'bucket', endpoint: 'https://s3.example' });
   getClientCredentials.mockResolvedValue({ accessKeyId: 'key', secretAccessKey: 'secret' });
   s3List.mockResolvedValue({ folders: [], objects: [], nextContinuationToken: null, isTruncated: false });
+  s3Get.mockResolvedValue(new Response(null, { status: 404 }));
+  s3Head.mockResolvedValue(new Response(null, { status: 404 }));
+  s3Copy.mockResolvedValue(undefined);
+  s3Delete.mockResolvedValue(undefined);
 });
 
 describe('trash read contract', () => {
@@ -142,5 +147,175 @@ describe('trash read contract', () => {
     s3List.mockResolvedValueOnce({ folders: [], objects: [{ key: `.mediapanel-trash/${uuid}/a`, size: 1, lastModified: '' }], nextContinuationToken: null, isTruncated: true });
     const truncatedDetail = await handleRequest(new Request(`https://worker.example/api/trash/${uuid}`, { headers }), env);
     expect(truncatedDetail.status).toBe(502);
+  });
+});
+
+describe('deleted objects never become publicly reachable', () => {
+  it('/file/:clientId/:key still returns 404 for a key inside .mediapanel-trash/, never serving deleted content', async () => {
+    const response = await handleRequest(
+      new Request(`https://worker.example/file/client/.mediapanel-trash/${uuid}/gallery/a.jpg`),
+      env,
+    );
+    expect(response.status).toBe(404);
+    expect(getClient).not.toHaveBeenCalled();
+    expect(s3Get).not.toHaveBeenCalled();
+  });
+});
+
+describe('GET /api/trash/:restoreToken/object — authenticated thumbnail read', () => {
+  const objectUrl = (token: string, key: string) =>
+    `https://worker.example/api/trash/${token}/object?key=${encodeURIComponent(key)}`;
+
+  it('requires X-API-Key (401 without it)', async () => {
+    const response = await handleRequest(
+      new Request(objectUrl(uuid, 'gallery/a.jpg'), { headers: { 'X-Client-ID': 'client' } }),
+      env,
+    );
+    expect(response.status).toBe(401);
+    expect(s3Get).not.toHaveBeenCalled();
+  });
+
+  it('requires X-Client-ID (400 without it)', async () => {
+    const response = await handleRequest(
+      new Request(objectUrl(uuid, 'gallery/a.jpg'), { headers: { 'X-API-Key': 'secret' } }),
+      env,
+    );
+    expect(response.status).toBe(400);
+    expect(s3Get).not.toHaveBeenCalled();
+  });
+
+  it('serves the object bytes with its real Content-Type and a private, non-shareable cache policy', async () => {
+    s3Get.mockResolvedValueOnce(new Response(new Uint8Array([1, 2, 3]), { status: 200, headers: { 'content-type': 'image/jpeg' } }));
+    const response = await handleRequest(new Request(objectUrl(uuid, 'gallery/a.jpg'), { headers }), env);
+    expect(response.status).toBe(200);
+    expect(response.headers.get('content-type')).toBe('image/jpeg');
+    expect(response.headers.get('cache-control')).toBe('private, no-store');
+    expect(s3Get).toHaveBeenCalledWith('bucket', `.mediapanel-trash/${uuid}/gallery/a.jpg`);
+  });
+
+  it('rejects a malformed restore token before touching storage', async () => {
+    const response = await handleRequest(new Request(objectUrl('not-a-uuid', 'gallery/a.jpg'), { headers }), env);
+    expect(response.status).toBe(400);
+    expect(s3Get).not.toHaveBeenCalled();
+  });
+
+  it('404s when the requested key does not exist under that client bucket (also covers a foreign client bucket)', async () => {
+    getClient.mockResolvedValueOnce({ bucketName: 'bucket-b', endpoint: 'https://s3.example' });
+    const response = await handleRequest(
+      new Request(objectUrl(uuid, 'gallery/a.jpg'), { headers: { ...headers, 'X-Client-ID': 'client-b' } }),
+      env,
+    );
+    expect(response.status).toBe(404);
+    expect(s3Get).toHaveBeenCalledWith('bucket-b', `.mediapanel-trash/${uuid}/gallery/a.jpg`);
+  });
+
+  it('blocks a relative traversal key from escaping the trash group, without ever calling storage', async () => {
+    const response = await handleRequest(new Request(objectUrl(uuid, '../secrets.jpg'), { headers }), env);
+    expect(response.status).toBe(404);
+    expect(s3Get).not.toHaveBeenCalled();
+  });
+
+  it('blocks an absolute-path key from escaping the trash group', async () => {
+    const response = await handleRequest(new Request(objectUrl(uuid, '/etc/passwd'), { headers }), env);
+    expect(response.status).toBe(404);
+    expect(s3Get).not.toHaveBeenCalled();
+  });
+
+  it('blocks a nested traversal segment buried inside an otherwise plausible key', async () => {
+    const response = await handleRequest(new Request(objectUrl(uuid, 'gallery/../../other-client/secret.jpg'), { headers }), env);
+    expect(response.status).toBe(404);
+    expect(s3Get).not.toHaveBeenCalled();
+  });
+});
+
+describe('POST /api/restore — partial restore by keys', () => {
+  const bodyHeaders = { ...headers, 'Content-Type': 'application/json' };
+  const restore = (body: unknown) =>
+    handleRequest(new Request('https://worker.example/api/restore', { method: 'POST', headers: bodyHeaders, body: JSON.stringify(body) }), env);
+
+  it('restores only the requested subset, leaving the rest of the group intact', async () => {
+    s3List.mockResolvedValueOnce({
+      folders: [],
+      objects: [
+        { key: `.mediapanel-trash/${uuid}/gallery/a.jpg`, size: 1, lastModified: '' },
+        { key: `.mediapanel-trash/${uuid}/gallery/b.jpg`, size: 1, lastModified: '' },
+        { key: `.mediapanel-trash/${uuid}/gallery/c.jpg`, size: 1, lastModified: '' },
+      ],
+      nextContinuationToken: null,
+      isTruncated: false,
+    });
+    const response = await restore({ restoreToken: uuid, keys: ['gallery/a.jpg'] });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, restored: ['gallery/a.jpg'] });
+    expect(s3Copy).toHaveBeenCalledTimes(1);
+    expect(s3Copy).toHaveBeenCalledWith('bucket', `.mediapanel-trash/${uuid}/gallery/a.jpg`, 'gallery/a.jpg');
+    expect(s3Delete).toHaveBeenCalledTimes(1);
+    expect(s3Delete).toHaveBeenCalledWith('bucket', `.mediapanel-trash/${uuid}/gallery/a.jpg`);
+  });
+
+  it('rejects the entire request when a requested key does not belong to the group — nothing is restored', async () => {
+    s3List.mockResolvedValueOnce({
+      folders: [],
+      objects: [{ key: `.mediapanel-trash/${uuid}/gallery/a.jpg`, size: 1, lastModified: '' }],
+      nextContinuationToken: null,
+      isTruncated: false,
+    });
+    const response = await restore({ restoreToken: uuid, keys: ['gallery/a.jpg', 'gallery/not-in-group.jpg'] });
+    expect(response.status).toBe(400);
+    expect(s3Copy).not.toHaveBeenCalled();
+    expect(s3Delete).not.toHaveBeenCalled();
+  });
+
+  it('restoring the last remaining key empties the group, which then drops out of GET /api/trash', async () => {
+    s3List.mockResolvedValueOnce({
+      folders: [],
+      objects: [{ key: `.mediapanel-trash/${uuid}/gallery/a.jpg`, size: 1, lastModified: '' }],
+      nextContinuationToken: null,
+      isTruncated: false,
+    });
+    const response = await restore({ restoreToken: uuid, keys: ['gallery/a.jpg'] });
+    expect(response.status).toBe(200);
+
+    // Once the group's only object is moved out, storage stops returning its
+    // prefix as a folder — the listing reflects that with no group at all.
+    s3List.mockResolvedValueOnce({ folders: [], objects: [], nextContinuationToken: null, isTruncated: false });
+    const listing = await handleRequest(new Request('https://worker.example/api/trash', { headers }), env);
+    expect(await listing.json()).toEqual({ groups: [], nextCursor: null });
+  });
+
+  it('keeps restoring the whole group when keys is omitted — existing bulk-undo behavior is unchanged', async () => {
+    s3List.mockResolvedValueOnce({
+      folders: [],
+      objects: [
+        { key: `.mediapanel-trash/${uuid}/gallery/a.jpg`, size: 1, lastModified: '' },
+        { key: `.mediapanel-trash/${uuid}/gallery/b.jpg`, size: 1, lastModified: '' },
+      ],
+      nextContinuationToken: null,
+      isTruncated: false,
+    });
+    const response = await restore({ restoreToken: uuid });
+    expect(response.status).toBe(200);
+    expect(await response.json()).toEqual({ ok: true, restored: ['gallery/a.jpg', 'gallery/b.jpg'] });
+    expect(s3Copy).toHaveBeenCalledTimes(2);
+    expect(s3Delete).toHaveBeenCalledTimes(2);
+  });
+
+  it('still enforces overwrite protection (409) and invalid-token/empty-group checks unchanged', async () => {
+    s3List.mockResolvedValueOnce({
+      folders: [],
+      objects: [{ key: `.mediapanel-trash/${uuid}/gallery/a.jpg`, size: 1, lastModified: '' }],
+      nextContinuationToken: null,
+      isTruncated: false,
+    });
+    s3Head.mockResolvedValueOnce(new Response(null, { status: 200 }));
+    const conflict = await restore({ restoreToken: uuid });
+    expect(conflict.status).toBe(409);
+
+    s3List.mockResolvedValueOnce({ folders: [], objects: [], nextContinuationToken: null, isTruncated: false });
+    const emptyGroup = await restore({ restoreToken: uuid });
+    expect(emptyGroup.status).toBe(404);
+
+    const badToken = await restore({ restoreToken: 'not-a-uuid' });
+    expect(badToken.status).toBe(400);
   });
 });

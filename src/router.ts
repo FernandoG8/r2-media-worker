@@ -38,6 +38,25 @@ function isTrashGroupPrefix(prefix: string): boolean {
     prefix.slice(TRASH_PREFIX.length, -1).indexOf('/') === -1;
 }
 
+// Same UUID shape /api/restore has always validated its token with.
+const RESTORE_TOKEN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/**
+ * Resolves a requested key to an absolute R2 key strictly inside `trashRoot`,
+ * or null if the key cannot possibly belong to that group. Membership is
+ * decided by exact-prefix construction (rejecting `.`/`..`/empty segments and
+ * absolute paths before concatenation), never by a substring `includes` check.
+ */
+function resolveTrashObjectKey(trashRoot: string, rawKey: string): string | null {
+  if (!rawKey || rawKey.includes('\\') || rawKey.includes('\0')) return null;
+  if (rawKey.startsWith('/')) return null;
+  const segments = rawKey.split('/');
+  if (segments.some(segment => segment === '' || segment === '.' || segment === '..')) return null;
+  const fullKey = `${trashRoot}${rawKey}`;
+  if (!fullKey.startsWith(trashRoot) || fullKey.length <= trashRoot.length) return null;
+  return fullKey;
+}
+
 async function listAllObjects(
   s3List: ReturnType<typeof createS3Client>['s3List'],
   bucket: string,
@@ -317,7 +336,7 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
   if (!clientId) {
     // Only require X-Client-ID for media endpoints below
     const mediaEndpoints = ['/api/list', '/api/upload', '/api/folder', '/api/delete', '/api/restore', '/api/bulk-delete', '/api/folders', '/api/rename', '/api/bulk-rename', '/api/delete-recursive', '/api/rename-folder', '/api/backups', '/api/backups/upload-url', '/api/backups/download-url', '/api/update-cache-header'];
-    if (mediaEndpoints.includes(url.pathname) || /^\/api\/trash(?:\/[^/]+)?$/.test(url.pathname)) {
+    if (mediaEndpoints.includes(url.pathname) || /^\/api\/trash(?:\/[^/]+(?:\/object)?)?$/.test(url.pathname)) {
       return json({ error: 'Missing X-Client-ID header' }, 400, origin);
     }
     return json({ error: 'Not found' }, 404, origin);
@@ -391,6 +410,38 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
     } catch {
       return json({ error: 'Could not list trash group' }, 502, origin);
     }
+  }
+
+  // ── GET /api/trash/:restoreToken/object?key=... — miniatura autenticada ──
+  // Serves trashed object bytes so the panel can render a thumbnail, without
+  // ever exposing them through the public /file/ route. Only objects that
+  // resolve strictly inside .mediapanel-trash/{restoreToken}/ of the calling
+  // client's own bucket are served; everything else is 404.
+  const trashObjectPath = /^\/api\/trash\/([^/]+)\/object$/.exec(url.pathname);
+  if (method === 'GET' && trashObjectPath) {
+    let token: string;
+    try {
+      token = decodeURIComponent(trashObjectPath[1]);
+    } catch {
+      return json({ error: 'Invalid restore token' }, 400, origin);
+    }
+    if (!RESTORE_TOKEN.test(token)) return json({ error: 'Invalid restore token' }, 400, origin);
+
+    const rawKey = url.searchParams.get('key');
+    if (!rawKey) return json({ error: 'Missing key' }, 400, origin);
+
+    const trashRoot = `${TRASH_PREFIX}${token}/`;
+    const fullKey = resolveTrashObjectKey(trashRoot, rawKey);
+    if (!fullKey) return json({ error: 'Not found' }, 404, origin);
+
+    const res = await s3.s3Get(client.bucketName, fullKey);
+    if (!res.ok) return json({ error: 'Not found' }, 404, origin);
+
+    const headers = new Headers(corsHeaders(origin));
+    headers.set('Content-Type', res.headers.get('content-type') || 'application/octet-stream');
+    // Deleted content of one specific client: never cacheable by a shared cache.
+    headers.set('Cache-Control', 'private, no-store');
+    return new Response(res.body, { headers });
   }
 
   // ── GET /api/list?prefix=&limit=50&cursor= ────────────────────────────────
@@ -585,16 +636,37 @@ export async function handleRequest(request: Request, env: Env): Promise<Respons
 
   // ── POST /api/restore — restaurar un borrado desde la papelera interna ──
   if (method === 'POST' && url.pathname === '/api/restore') {
-    const { restoreToken, overwriteExisting } = await request.json<{ restoreToken: string; overwriteExisting?: boolean }>();
-    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(restoreToken ?? '')) {
+    const { restoreToken, overwriteExisting, keys } = await request.json<{
+      restoreToken: string;
+      overwriteExisting?: boolean;
+      keys?: string[];
+    }>();
+    if (!RESTORE_TOKEN.test(restoreToken ?? '')) {
       return json({ error: 'Invalid restore token' }, 400, origin);
+    }
+    if (keys !== undefined && (!Array.isArray(keys) || keys.length === 0 || keys.some(k => typeof k !== 'string'))) {
+      return json({ error: 'Invalid keys' }, 400, origin);
     }
 
     const trashRoot = `${TRASH_PREFIX}${restoreToken}/`;
     const trashedObjects = await listAllObjects(s3.s3List, client.bucketName, trashRoot);
     if (trashedObjects.length === 0) return json({ error: 'Deleted item not found' }, 404, origin);
 
-    const restores = trashedObjects.map(object => ({
+    // Without `keys`, restore the whole group — unchanged behavior relied on
+    // by the batch-delete undo already in production. With `keys`, restore
+    // only that subset of the group's original keys: reject the entire
+    // request (nothing restored) if any requested key is not in this group.
+    let selectedObjects = trashedObjects;
+    if (keys) {
+      const byOriginalKey = new Map(trashedObjects.map(object => [object.key.slice(trashRoot.length), object]));
+      const missing = keys.filter(key => !byOriginalKey.has(key));
+      if (missing.length > 0) {
+        return json({ error: `Keys not found in group: ${missing.join(', ')}` }, 400, origin);
+      }
+      selectedObjects = Array.from(new Set(keys)).map(key => byOriginalKey.get(key)!);
+    }
+
+    const restores = selectedObjects.map(object => ({
       sourceKey: object.key,
       destKey: object.key.slice(trashRoot.length),
     }));
