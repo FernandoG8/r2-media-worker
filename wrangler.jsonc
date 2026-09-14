@@ -17,6 +17,10 @@
     }
   ],
   "vars": {
-    "ALLOWED_ORIGIN": "https://panel-v2.mizcor.dev"
+    "ALLOWED_ORIGIN": "https://panel-v2.mizcor.dev",
+    // Access enforcement on /api/* is suspended until this is explicitly set
+    // to "enabled" (see src/access.ts). No Cloudflare Access application
+    // exists for this account yet; X-API-Key remains the enforced check.
+    "ACCESS_ENFORCEMENT": "suspended"
   }
 }

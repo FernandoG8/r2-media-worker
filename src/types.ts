@@ -7,6 +7,15 @@ export interface Env {
   TEAM_DOMAIN: string;
   /** Access Application audience (`aud`) for this Worker API. */
   POLICY_AUD: string;
+  /**
+   * Explicit opt-in switch for Cloudflare Access enforcement on `/api/*`.
+   * Must be exactly `"enabled"` for `verifyAccessJwt` to run; any other value
+   * (including absence) suspends enforcement. This is intentionally opt-in
+   * rather than inferred from `TEAM_DOMAIN`/`POLICY_AUD` presence, so a typo
+   * in those variables cannot silently disable protection. When enabled,
+   * missing or invalid `TEAM_DOMAIN`/`POLICY_AUD` still fail closed (503).
+   */
+  ACCESS_ENFORCEMENT: string;
 }
 
 export interface ClientConfig {
